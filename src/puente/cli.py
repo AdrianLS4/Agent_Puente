@@ -1,0 +1,262 @@
+"""CLI de demo.   python -m puente.cli demo [escenario|all]   ·   errors   ·   live-check"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from datetime import datetime, timedelta
+
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+from .config import Settings
+from .db import connect, init_db, iso, utcnow
+from .errors import catalog_markdown
+from .fx import http_fetcher, mock_fetcher
+from .orchestrator import Orchestrator, StepResult
+from .paypal_gateway import LivePayPal, MockPayPal, PayPalError
+from .seed import seed
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = utcnow()
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, minutes: float = 0, hours: float = 0) -> None:
+        self.now += timedelta(minutes=minutes, hours=hours)
+
+
+def say(step: str, r: StepResult) -> StepResult:
+    flag = "✓" if r.ok else "✗"
+    code = f" [{r.code}]" if r.code else ""
+    print(f"  {flag} {step:<28} → {r.state}{code}  {r.message_es}")
+    return r
+
+
+BRAIN = None   # se activa con `demo --llm` (requiere OPENAI_API_KEY)
+LIVE_MODE = False
+
+
+def build(brain=None, settings: Settings | None = None, mock: bool | None = None, **orch_kw):
+    s = settings or Settings()
+    is_mock = mock if mock is not None else (s.mock_mode and not LIVE_MODE)
+    conn = connect(":memory:")
+    init_db(conn)
+    seed(conn)
+    if is_mock:
+        clock, gw = Clock(), MockPayPal()
+        fetcher = mock_fetcher(40.0)
+        sleep_fn = lambda s: None
+    else:
+        clock = utcnow
+        gw = LivePayPal(s.paypal_client_id, s.paypal_secret, sandbox=s.paypal_sandbox)
+        fetcher = http_fetcher(s.fx_url, s.fx_json_path) if s.fx_url else mock_fetcher(40.0)
+        sleep_fn = time.sleep
+    orch = Orchestrator(conn, gw, s, fetcher, brain=brain or BRAIN, sleep=sleep_fn,
+                        clock=clock, **orch_kw)
+    return conn, orch, gw, clock
+
+
+def start(orch: Orchestrator, key: str, item_id: int = 1, pick: int = 1) -> int:
+    rid = say("crear solicitud", orch.create_request(1, item_id, "0102", key)).data["request_id"]
+    q = say("cotizar + ranking", orch.quote(rid))
+    print(f"      tasa ref: {q.data.get('fx_rate')} Bs/USD (fuente: {'respaldo' if q.data.get('fx_fallback') else 'en vivo'})")
+    for x in q.data.get("quotes", []):
+        print(f"      #{x['rank']} {x['display_name']:<30} score {x['score']:>5}  total {x['total_ves']:>9} Bs.")
+    print(f"      descartados: {q.data.get('rejected')}")
+    say("elegir cotización", orch.select_quote(rid, pick))
+    return rid
+
+
+def pay_and_capture(orch, gw, rid) -> None:
+    q = orch._row("SELECT total_ves FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
+    say("pago Bs. confirmado", orch.confirm_ves(rid, f"REF{rid}001", q["total_ves"]))
+    o = say("crear orden PayPal", orch.create_paypal_order(rid))
+    if isinstance(gw, MockPayPal):
+        gw.approve(o.data["paypal_order_id"])                      # el proveedor aprueba en PayPal sandbox
+    else:
+        print(f"\n      [SANDBOX] Orden real creada: {o.data['paypal_order_id']}")
+        print(f"      [SANDBOX] Abrí este link con tu cuenta Personal de Sandbox para aprobar:")
+        print(f"      >>> {o.data['approve_url']}\n")
+        input("      Presioná [ENTER] una vez que hayas aprobado en el navegador...")
+    say("capturar", orch.capture(rid))
+
+
+def sc_happy():
+    """Flujo feliz (comercio digital)."""
+    _, orch, gw, _ = build()
+    rid = start(orch, "k-happy")
+    pay_and_capture(orch, gw, rid)
+    say("entrega digital", orch.record_delivery(rid, proof="LICENCIA-ABC-123", delivered=True))
+    say("cliente confirma", orch.confirm_receipt(rid))
+
+
+def sc_retries():
+    """Errores transitorios de PayPal: 429 x2 en create_order, y rechazo de instrumento en la captura."""
+    _, orch, gw, _ = build()
+    rid = start(orch, "k-retry")
+    gw.fail_next["create_order"] = [PayPalError(429, "RATE_LIMIT_REACHED"), PayPalError(429, "RATE_LIMIT_REACHED")]
+    q = orch._row("SELECT total_ves FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
+    say("pago Bs. confirmado", orch.confirm_ves(rid, "REFR001", q["total_ves"]))
+    o = say("crear orden (con 429s)", orch.create_paypal_order(rid))
+    gw.approve(o.data["paypal_order_id"])
+    gw.fail_next["capture_order"] = [PayPalError(422, "UNPROCESSABLE_ENTITY", "INSTRUMENT_DECLINED")]
+    say("capturar (tarjeta rechazada)", orch.capture(rid))
+    say("capturar (reintento)", orch.capture(rid))
+    n = orch.conn.execute("SELECT COUNT(*) c FROM error_events").fetchone()["c"]
+    print(f"      error_events registrados: {n}")
+
+
+def sc_failover():
+    """El proveedor no aprueba el pago: se devuelven Bs., se penaliza y se reabre con otro."""
+    conn, orch, gw, clock = build()
+    rid = start(orch, "k-fo")
+    q = orch._row("SELECT total_ves, provider_id FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
+    say("pago Bs. confirmado", orch.confirm_ves(rid, "REFFO001", q["total_ves"]))
+    say("crear orden PayPal", orch.create_paypal_order(rid))
+    clock.advance(minutes=16)
+    for rid_, st, code in orch.check_timeouts():
+        print(f"      scheduler: solicitud {rid_} ({st}) → {code}")
+    child = conn.execute("SELECT id, excluded_providers, state FROM purchase_requests WHERE parent_request_id=?", (rid,)).fetchone()
+    print(f"      solicitud hija #{child['id']} excluye proveedores {child['excluded_providers']}")
+    say("cotizar (hija)", orch.quote(child["id"]))
+    failed = conn.execute("SELECT display_name, failed_orders FROM providers WHERE id=?", (q["provider_id"],)).fetchone()
+    print(f"      penalización: {failed['display_name']} → failed_orders={failed['failed_orders']}")
+
+
+def sc_delivery_timeout():
+    """Pagado pero el comercio no entrega: reembolso PayPal + devolución en Bs."""
+    _, orch, gw, clock = build()
+    rid = start(orch, "k-dt")
+    pay_and_capture(orch, gw, rid)
+    clock.advance(hours=25)
+    for rid_, st, code in orch.check_timeouts():
+        print(f"      scheduler: solicitud {rid_} ({st}) → {code}")
+    print("      llamadas a PayPal:", [c[0] for c in gw.calls])
+
+
+def _dispute(item_id: int, delivered: bool, hours: float = 72):
+    _, orch, gw, clock = build()
+    rid = start(orch, f"k-disp-{item_id}-{delivered}", item_id=item_id)
+    pay_and_capture(orch, gw, rid)
+    if delivered:
+        say("entrega digital", orch.record_delivery(rid, proof="LICENCIA-XYZ", delivered=True))
+    r = say("disputa abierta", orch.open_dispute(rid, f"PP-D-{rid}", "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
+                                                 clock() + timedelta(hours=hours)))
+    d = orch.conn.execute("SELECT decision, decided_by, proof_strength FROM disputes WHERE request_id=?", (rid,)).fetchone()
+    print(f"      decisión={d['decision']} por={d['decided_by']} prueba={d['proof_strength']}")
+    return orch, rid
+
+
+def sc_dispute_contest():
+    """Disputa con prueba de entrega fuerte → el agente contesta con evidencia."""
+    orch, rid = _dispute(1, delivered=True)
+    say("PayPal resuelve: ganada", orch.resolve_dispute_outcome(rid, "won"))
+
+
+def sc_dispute_accept():
+    """Disputa sin prueba y monto bajo → aceptar y devolver."""
+    _dispute(1, delivered=False)
+
+
+def sc_dispute_human():
+    """Monto alto ($120 > $50) → expediente listo y escalado a humano."""
+    orch, _ = _dispute(2, delivered=False)
+    print("      cola humana:", [dict(r) for r in orch.conn.execute("SELECT reason_code, status FROM human_review_queue")])
+
+
+def sc_invoice():
+    """Flujo de facturación B2B (Invoicing v2): creación, envío, pago y entrega."""
+    _, orch, gw, _ = build()
+    rid = start(orch, "k-invoice", item_id=2)
+    q = orch._row("SELECT total_ves FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
+    say("pago Bs. confirmado", orch.confirm_ves(rid, f"REFINV{rid}", q["total_ves"]))
+    inv = say("crear y enviar factura", orch.create_paypal_invoice(rid))
+    if isinstance(gw, MockPayPal):
+        gw.pay_invoice(inv.data["paypal_invoice_id"])
+    else:
+        print(f"\n      [SANDBOX] Factura enviada: {inv.data['paypal_invoice_id']}")
+        print(f"      [SANDBOX] Pagar factura en este link:")
+        print(f"      >>> {inv.data['invoice_url']}\n")
+        input("      Presioná [ENTER] una vez que hayas pagado la factura en el navegador...")
+    say("verificar pago factura", orch.check_invoice_paid(rid))
+    say("entrega digital", orch.record_delivery(rid, proof="SAAS-TOKEN-1234", delivered=True))
+    say("cliente confirma", orch.confirm_receipt(rid))
+
+
+SCENARIOS = {
+    "happy": sc_happy, "invoice": sc_invoice, "retries": sc_retries, "failover": sc_failover, "delivery-timeout": sc_delivery_timeout,
+    "dispute-contest": sc_dispute_contest, "dispute-accept": sc_dispute_accept, "dispute-human": sc_dispute_human,
+}
+
+
+def live_check() -> int:
+    """Día 1: confirma credenciales sandbox y crea una orden REAL de prueba vía el Agent Toolkit."""
+    s = Settings()
+    if not (s.paypal_client_id and s.paypal_secret):
+        print("Faltan PAYPAL_CLIENT_ID / PAYPAL_SECRET en .env (créalas en developer.paypal.com → Apps & Credentials → Sandbox).")
+        return 1
+    from .paypal_gateway import LivePayPal
+    gw = LivePayPal(s.paypal_client_id, s.paypal_secret, sandbox=True)
+    out = gw.create_order(amount_usd=1.00, item_name="PUENTE live-check", reference_id="LIVE-CHECK")
+    print("orden creada:", out["order_id"], out["status"])
+    print("aprobar con la cuenta sandbox PERSONAL (proveedor):", out["approve_url"])
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="puente")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("demo")
+    d.add_argument("scenario", nargs="?", default="all", choices=["all", *SCENARIOS])
+    d.add_argument("--llm", action="store_true", help="usa el AgentBrain (OpenAI Agents SDK) en disputas")
+    d.add_argument("--live", action="store_true", help="usa PayPal Sandbox real y tasa real de mercado")
+    sub.add_parser("errors")
+    sub.add_parser("live-check")
+    srv = sub.add_parser("serve", help="inicia el servidor de webhooks y scheduler de timeouts")
+    srv.add_argument("--host", default="127.0.0.1", help="host donde escuchar")
+    srv.add_argument("--port", type=int, default=8000, help="puerto donde escuchar")
+    a = p.parse_args(argv)
+    if a.cmd == "demo":
+        global LIVE_MODE
+        s = Settings()
+        if a.live or not s.mock_mode:
+            LIVE_MODE = True
+            if a.scenario == "all":
+                print("━━ Modo LIVE detectado: ejecutando flujo 'happy' contra PayPal Sandbox real y tasa real")
+                a.scenario = "happy"
+        if a.llm:
+            global BRAIN
+            from .agents import AgentBrain
+            BRAIN = AgentBrain(s)
+    if a.cmd == "errors":
+        print("# Catálogo de errores\n")
+        print(catalog_markdown())
+        return 0
+    if a.cmd == "live-check":
+        return live_check()
+    if a.cmd == "serve":
+        import uvicorn
+        print(f"━━ Iniciando servidor de webhooks y scheduler en http://{a.host}:{a.port}")
+        print("   Webhooks endpoint: POST /webhooks/paypal")
+        print("   Scheduler tick:    POST /scheduler/tick")
+        print("   Health endpoint:   GET  /health")
+        uvicorn.run("puente.server:app", host=a.host, port=a.port, reload=False)
+        return 0
+    for name in (SCENARIOS if a.scenario == "all" else [a.scenario]):
+        print(f"\n━━ {name}: {SCENARIOS[name].__doc__}")
+        SCENARIOS[name]()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

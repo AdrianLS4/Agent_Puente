@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+puente.db
+*.db-journal
+.pytest_cache/
+*.egg-info/
+cloudflared.exe
+*.log
+.vscode/
+.idea/

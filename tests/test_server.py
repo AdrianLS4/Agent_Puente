@@ -139,3 +139,56 @@ def test_webhook_invoice_paid_triggers_completion(test_setup):
 
     req = conn.execute("SELECT state FROM purchase_requests WHERE id=?", (rid,)).fetchone()
     assert req["state"] == S.AWAITING_DELIVERY
+
+
+def test_p2p_api_intent_and_escrow_flow(test_setup):
+    """Prueba de la API P2P con IA: lenguaje natural -> ofertas + explicación IA -> Escrow -> Pago Móvil -> Liberar."""
+    conn, orch, gw, clock, client = test_setup
+
+    # 1. María envía su intención en lenguaje natural
+    intent_resp = client.post("/p2p/intent", json={
+        "text": "Hola, quiero comprar el curso de Python que cuesta 29 dólares y tengo cuenta en Banco de Venezuela",
+        "customer_id": 1,
+    })
+    assert intent_resp.status_code == 200
+    intent_data = intent_resp.json()
+    rid = intent_data["request_id"]
+    assert intent_data["state"] == S.QUOTED
+    assert intent_data["parsed_intent"]["amount_usd"] == 29.0
+    assert len(intent_data["quotes"]) >= 1
+    assert "Recomiendo" in intent_data["ai_explanation"]   # IA presente y activa
+
+    # 2. María elige al proveedor #1 -> se crea orden Escrow (retención)
+    sel_resp = client.post(f"/p2p/requests/{rid}/select", json={"rank": 1})
+    assert sel_resp.status_code == 200
+    oid = sel_resp.json()["paypal_order_id"]
+
+    # 3. Carlos aprueba en PayPal y se bloquean los fondos en PayPal Escrow
+    gw.approve(oid)
+    lock_resp = client.post(f"/p2p/requests/{rid}/lock")
+    assert lock_resp.status_code == 200
+    assert lock_resp.json()["state"] == S.USD_ESCROW_LOCKED
+
+    # 4. María consulta el ticket de Pago Móvil con datos seguros de Carlos
+    ticket_resp = client.get(f"/p2p/requests/{rid}/ticket")
+    assert ticket_resp.status_code == 200
+    ticket = ticket_resp.json()["ticket"]
+    assert ticket["usd_locked"] is True
+    assert ticket["bank_code"] == "0102"
+    assert "0414" in ticket["phone"] or "0412" in ticket["phone"]
+
+    # 5. María paga en su banco e ingresa la referencia
+    pay_resp = client.post(f"/p2p/requests/{rid}/confirm-ves", json={
+        "reference": "REF-BDV-123456",
+        "amount_ves": ticket["total_ves"],
+    })
+    assert pay_resp.status_code == 200
+
+    # 6. Carlos confirma que recibió los Bolívares y PUENTE libera los USD al comercio
+    release_resp = client.post(f"/p2p/requests/{rid}/release")
+    assert release_resp.status_code == 200
+    assert release_resp.json()["state"] == "COMPLETED"
+
+    # Verificar estado final en la base de datos
+    db_req = conn.execute("SELECT state FROM purchase_requests WHERE id=?", (rid,)).fetchone()
+    assert db_req["state"] == S.COMPLETED

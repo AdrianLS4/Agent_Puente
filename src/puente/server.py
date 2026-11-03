@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any
@@ -98,6 +99,90 @@ def create_app(
             "quotes": [dict(q) for q in quotes],
             "history": [dict(e) for e in events],
         }
+
+    @app.post("/p2p/intent")
+    def p2p_intent(payload: dict = Body(...)):
+        """María: entrada en lenguaje natural procesada con IA -> solicitud + cotizaciones rankeadas con explicación."""
+        text = payload.get("text", "")
+        if not text:
+            raise HTTPException(status_code=400, detail="Falta el campo 'text' con la solicitud.")
+        cid = payload.get("customer_id", 1)
+        bank = payload.get("bank")
+        key = payload.get("idempotency_key") or f"intent-{int(time.time() * 1000)}"
+
+        res = orch.create_request_from_text(cid, text, key, bank=bank)
+        if not res.ok:
+            raise HTTPException(status_code=400, detail=res.message_es)
+        rid = res.data["request_id"]
+        q_res = orch.quote(rid)
+        if not q_res.ok:
+            raise HTTPException(status_code=400, detail=q_res.message_es)
+
+        return {
+            "request_id": rid,
+            "state": q_res.state,
+            "parsed_intent": res.data.get("parsed_intent"),
+            "matched_item": res.data.get("matched_item"),
+            "fx_rate": q_res.data.get("fx_rate"),
+            "quotes": q_res.data.get("quotes"),
+            "ai_explanation": q_res.data.get("ai_explanation"),
+        }
+
+    @app.post("/p2p/requests/{request_id}/select")
+    def p2p_select_and_escrow(request_id: int, payload: dict = Body(default={})):
+        """María elige una oferta -> PUENTE crea la orden de retención en PayPal (Escrow)."""
+        rank = payload.get("rank", 1)
+        sel = orch.select_quote(request_id, rank=rank)
+        if not sel.ok:
+            raise HTTPException(status_code=400, detail=sel.message_es)
+        escrow = orch.create_escrow_order(request_id)
+        if not escrow.ok:
+            raise HTTPException(status_code=400, detail=escrow.message_es)
+        return {
+            "request_id": request_id,
+            "state": escrow.state,
+            "paypal_order_id": escrow.data.get("paypal_order_id"),
+            "approve_url": escrow.data.get("approve_url"),
+        }
+
+    @app.get("/p2p/requests/{request_id}/ticket")
+    def p2p_get_ticket(request_id: int):
+        """María obtiene los datos del Pago Móvil (solo si los dólares ya están retenidos)."""
+        req = conn.execute("SELECT state FROM purchase_requests WHERE id=?", (request_id,)).fetchone()
+        if not req:
+            raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+        ticket = orch.get_pago_movil_ticket(request_id)
+        return {"ticket": ticket, "state": req["state"]}
+
+    @app.post("/p2p/requests/{request_id}/lock")
+    def p2p_lock_usd(request_id: int):
+        """Carlos: una vez aprobada la orden en PayPal, PUENTE autoriza y retiene los USD en custodia."""
+        res = orch.lock_usd_escrow(request_id)
+        if not res.ok:
+            raise HTTPException(status_code=400, detail=res.message_es)
+        return {"status": "ok", "state": res.state, "ticket": res.data.get("ticket")}
+
+    @app.post("/p2p/requests/{request_id}/confirm-ves")
+    def p2p_confirm_ves(request_id: int, payload: dict = Body(...)):
+        """María: envía comprobante y referencia del Pago Móvil."""
+        ref = payload.get("reference")
+        amount = payload.get("amount_ves")
+        if not ref or not amount:
+            raise HTTPException(status_code=400, detail="Faltan 'reference' y 'amount_ves'.")
+        res = orch.confirm_ves(request_id, ref, float(amount))
+        if not res.ok:
+            raise HTTPException(status_code=400, detail=res.message_es)
+        return {"status": "ok", "state": res.state, "reference": ref}
+
+    @app.post("/p2p/requests/{request_id}/release")
+    def p2p_release(request_id: int):
+        """Carlos: confirma que recibió los Bolívares en su banco -> PUENTE libera y captura los USD."""
+        res = orch.provider_release_and_capture(request_id)
+        if not res.ok:
+            raise HTTPException(status_code=400, detail=res.message_es)
+        orch.record_delivery(request_id, proof="LICENCIA-ONLINE-2026", delivered=True)
+        orch.confirm_receipt(request_id)
+        return {"status": "ok", "state": "COMPLETED", "capture_id": res.data.get("capture_id")}
 
     @app.post("/scheduler/tick")
     def trigger_scheduler():

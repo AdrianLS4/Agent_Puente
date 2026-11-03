@@ -26,6 +26,8 @@ from .state_machine import InvalidTransition, State as S, get_state, transition
 
 class Brain(Protocol):
     def decide_dispute(self, ctx: dict, allowed: set[str]) -> dict: ...   # {"decision","rationale_es"}
+    def parse_intent(self, text: str) -> Any: ...
+    def explain_quotes(self, quotes: list[dict]) -> str: ...
 
 
 @dataclass
@@ -149,6 +151,39 @@ class Orchestrator:
         self.conn.commit()
         return StepResult(True, S.CREATED, "Solicitud creada.", None, {"request_id": rid})
 
+    def create_request_from_text(self, customer_id: int, natural_text: str, idempotency_key: str,
+                                 bank: str | None = None) -> StepResult:
+        """Usa el IntakeAgent (IA) para procesar lenguaje natural y crear la solicitud estructurada."""
+        intent = None
+        if self.brain and hasattr(self.brain, "parse_intent"):
+            try:
+                intent = self.brain.parse_intent(natural_text)
+            except Exception:
+                pass
+        if not intent:
+            from .agents import fallback_parse_intent
+            intent = fallback_parse_intent(natural_text)
+
+        # Buscar item de catálogo que coincida por monto o título
+        item = None
+        if intent.amount_usd:
+            item = self._row(
+                "SELECT * FROM catalog_items WHERE active=1 ORDER BY ABS(price_usd - ?) ASC LIMIT 1",
+                intent.amount_usd)
+        if not item and intent.merchant_hint:
+            item = self._row(
+                "SELECT * FROM catalog_items WHERE active=1 AND title LIKE ? LIMIT 1",
+                f"%{intent.merchant_hint}%")
+        if not item:
+            item = self._row("SELECT * FROM catalog_items WHERE active=1 ORDER BY id ASC LIMIT 1")
+
+        final_bank = bank or intent.customer_bank or "0102"
+        res = self.create_request(customer_id, item["id"], final_bank, idempotency_key)
+        intent_dict = intent.model_dump() if hasattr(intent, "model_dump") else vars(intent)
+        res.data["parsed_intent"] = intent_dict
+        res.data["matched_item"] = dict(item)
+        return res
+
     def _load_providers(self) -> list[ProviderProfile]:
         out = []
         for r in self.conn.execute("SELECT * FROM providers"):
@@ -186,9 +221,20 @@ class Orchestrator:
         self.conn.commit()
         self._to(rid, S.QUOTED, payload={"fx": fx.rate, "fx_fallback": fx.is_fallback,
                                          "rejected": result.rejected})
+        quotes_list = [vars(q) for q in result.quotes]
+        ai_explanation = ""
+        if self.brain and hasattr(self.brain, "explain_quotes"):
+            try:
+                ai_explanation = self.brain.explain_quotes(quotes_list)
+            except Exception:
+                pass
+        if not ai_explanation:
+            from .agents import fallback_explain_quotes
+            ai_explanation = fallback_explain_quotes(quotes_list)
+
         return StepResult(True, S.QUOTED, "Cotizaciones listas.", None, {
             "fx_rate": fx.rate, "fx_fallback": fx.is_fallback, "rejected": result.rejected,
-            "quotes": [vars(q) for q in result.quotes]})
+            "quotes": quotes_list, "ai_explanation": ai_explanation})
 
     def select_quote(self, rid: int, rank: int = 1) -> StepResult:
         q = self._row("SELECT * FROM quotes WHERE request_id=? AND rank=? AND status='offered'", rid, rank)

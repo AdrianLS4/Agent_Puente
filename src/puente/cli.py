@@ -193,9 +193,139 @@ def sc_invoice():
     say("cliente confirma", orch.confirm_receipt(rid))
 
 
+def print_pago_movil_ticket(ticket: dict) -> None:
+    print("\n      ┌──────────────────────────────────────────────────────────────┐")
+    print("      │ 🔒 TICKET DE PAGO MÓVIL (Dólares retenidos en PayPal Escrow) │")
+    print("      ├──────────────────────────────────────────────────────────────┤")
+    print(f"      │ Proveedor:    {ticket['provider_name']:<46} │")
+    print(f"      │ Banco:        {ticket['bank_name']:<46} │")
+    print(f"      │ Teléfono:     {ticket['phone']:<46} │")
+    print(f"      │ C.I.:         {ticket['id_doc']:<46} │")
+    print(f"      │ Titular:      {ticket['holder_name']:<46} │")
+    print(f"      │ Monto exacto: {ticket['total_ves']:>10.2f} Bs.                            │")
+    print(f"      │ Concepto:     {ticket['concept_code']:<46} │")
+    print(f"      │ Escrow ID:    {str(ticket['authorization_id']):<46} │")
+    print("      └──────────────────────────────────────────────────────────────┘\n")
+
+
+def sc_escrow():
+    """Flujo P2P con Escrow (estilo Binance): retener USD -> Ticket Pago Móvil -> Pagar Bs -> Liberar."""
+    _, orch, gw, _ = build()
+    rid = start(orch, "k-escrow", item_id=1)
+
+    # 1. Crear orden con intent AUTHORIZE
+    o = say("crear orden Escrow USD", orch.create_escrow_order(rid))
+    oid = o.data["paypal_order_id"]
+    if isinstance(gw, MockPayPal):
+        gw.approve(oid)
+    else:
+        print(f"\n      [SANDBOX] Orden de retención creada: {oid}")
+        print(f"      [SANDBOX] El proveedor aprueba la retención en PayPal:")
+        print(f"      >>> {o.data['approve_url']}\n")
+        input("      Presioná [ENTER] una vez que hayas aprobado en el navegador...")
+
+    # 2. Bloquear USD en custodia y emitir ticket de Pago Móvil
+    lock = say("bloquear USD en custodia", orch.lock_usd_escrow(rid))
+    ticket = lock.data["ticket"]
+    print_pago_movil_ticket(ticket)
+
+    # 3. El comprador hace el Pago Móvil
+    ref = f"REF{rid}9988"
+    if not isinstance(gw, MockPayPal):
+        ref_in = input(f"      Ingresá el número de referencia del Pago Móvil [{ref}]: ").strip()
+        if ref_in:
+            ref = ref_in
+    say("pago Bs. registrado", orch.confirm_ves(rid, ref, ticket["total_ves"]))
+
+    # 4. El proveedor confirma que recibió los Bolívares (botón estilo Binance)
+    if not isinstance(gw, MockPayPal):
+        input("\n      [PROVEEDOR] Presioná [ENTER] para confirmar que recibiste los Bs. (Liberar dólares)...")
+    say("proveedor libera fondos", orch.provider_release_and_capture(rid))
+
+    # 5. Entrega y confirmación
+    say("entrega digital", orch.record_delivery(rid, proof="LICENCIA-ESCROW-2026", delivered=True))
+    say("cliente confirma recepción", orch.confirm_receipt(rid))
+
+
+def interactive_chat():
+    """Modo conversacional interactivo (asistente PUENTE en terminal)."""
+    conn, orch, gw, _ = build()
+    print("━" * 65)
+    print("🤖 ¡Hola! Soy PUENTE, tu agente de compras P2P transfronterizas.")
+    print("━" * 65)
+    print("Catálogo de productos disponibles hoy:")
+    items = conn.execute("SELECT c.id, c.title, c.price_usd, m.name as merchant FROM catalog_items c JOIN merchants m ON c.merchant_id=m.id WHERE c.active=1").fetchall()
+    for it in items:
+        print(f"  [{it['id']}] {it['title']:<38} ${it['price_usd']:>6.2f} USD ({it['merchant']})")
+    print("━" * 65)
+
+    choice = input("\n👉 ¿Qué producto querés comprar? (Ingresá el número 1, 2 o 3) [1]: ").strip() or "1"
+    item_id = int(choice) if choice.isdigit() else 1
+
+    bank = input("👉 ¿En qué banco tenés tus Bolívares? (0102=Venezuela, 0134=Banesco, 0105=Mercantil) [0102]: ").strip() or "0102"
+
+    key = f"chat-{int(time.time())}"
+    print(f"\n⏳ Procesando tu solicitud...")
+    rid = orch.create_request(1, item_id, bank, key).data["request_id"]
+    q_res = orch.quote(rid)
+    print(f"📈 Tasa de mercado de referencia: {q_res.data.get('fx_rate')} Bs/USD")
+
+    quotes = q_res.data.get("quotes", [])
+    print("\nProveedores disponibles encontrados y rankeados:")
+    for x in quotes:
+        print(f"  #{x['rank']} {x['display_name']:<32} Total: {x['total_ves']:>10.2f} Bs.  Score: {x['score']}/100")
+
+    orch.select_quote(rid, 1)
+    print(f"\n✅ Seleccionado el Proveedor #1 (Mejor precio y reputación).")
+
+    print("\n⏳ Creando orden de retención (Escrow) en PayPal...")
+    escrow = orch.create_escrow_order(rid)
+    oid = escrow.data["paypal_order_id"]
+
+    if isinstance(gw, MockPayPal):
+        gw.approve(oid)
+    else:
+        print(f"\n🔗 [SANDBOX] Link de aprobación de PayPal para retener los fondos:")
+        print(f"   {escrow.data['approve_url']}")
+        input("\nPresioná [ENTER] una vez que hayas aprobado en PayPal Sandbox...")
+
+    print("\n🔒 Bloqueando dólares en PayPal...")
+    locked = orch.lock_usd_escrow(rid)
+    ticket = locked.data["ticket"]
+    print_pago_movil_ticket(ticket)
+
+    ref = input(f"📲 Ingresá el número de comprobante/referencia de tu Pago Móvil: ").strip() or f"REF-{rid}7788"
+    orch.confirm_ves(rid, ref, ticket["total_ves"])
+    print(f"\n✅ Pago Móvil registrado con referencia: {ref}")
+
+    if not isinstance(gw, MockPayPal):
+        input("\n[PROVEEDOR P2P] Presioná [ENTER] en la consola para confirmar recepción de Bolívares y liberar dólares...")
+    else:
+        print("👤 Proveedor revisó su cuenta bancaria y confirmó recepción de Bolívares.")
+
+    print("\n💸 Liberando autorización de PayPal y pagando al comercio...")
+    orch.provider_release_and_capture(rid)
+
+    print("\n📦 Comercio procesando entrega digital...")
+    orch.record_delivery(rid, proof="LICENCIA-ACTIVADA-2026", delivered=True)
+    orch.confirm_receipt(rid)
+
+    print("━" * 65)
+    print("🎉 ¡COMPRA EXITOSA! Tu licencia digital ha sido entregada:")
+    print("   🔑 LICENCIA-ACTIVADA-2026")
+    print("━" * 65)
+
+
 SCENARIOS = {
-    "happy": sc_happy, "invoice": sc_invoice, "retries": sc_retries, "failover": sc_failover, "delivery-timeout": sc_delivery_timeout,
-    "dispute-contest": sc_dispute_contest, "dispute-accept": sc_dispute_accept, "dispute-human": sc_dispute_human,
+    "escrow": sc_escrow,
+    "happy": sc_happy,
+    "invoice": sc_invoice,
+    "retries": sc_retries,
+    "failover": sc_failover,
+    "delivery-timeout": sc_delivery_timeout,
+    "dispute-contest": sc_dispute_contest,
+    "dispute-accept": sc_dispute_accept,
+    "dispute-human": sc_dispute_human,
 }
 
 
@@ -214,6 +344,7 @@ def live_check() -> int:
 
 
 def main(argv=None) -> int:
+    global LIVE_MODE, BRAIN
     p = argparse.ArgumentParser(prog="puente")
     sub = p.add_subparsers(dest="cmd", required=True)
     d = sub.add_parser("demo")
@@ -222,12 +353,13 @@ def main(argv=None) -> int:
     d.add_argument("--live", action="store_true", help="usa PayPal Sandbox real y tasa real de mercado")
     sub.add_parser("errors")
     sub.add_parser("live-check")
+    ch = sub.add_parser("chat", help="inicia el chat interactivo con PUENTE y Pago Móvil")
+    ch.add_argument("--live", action="store_true", help="usa PayPal Sandbox real y tasa real de mercado")
     srv = sub.add_parser("serve", help="inicia el servidor de webhooks y scheduler de timeouts")
     srv.add_argument("--host", default="127.0.0.1", help="host donde escuchar")
     srv.add_argument("--port", type=int, default=8000, help="puerto donde escuchar")
     a = p.parse_args(argv)
     if a.cmd == "demo":
-        global LIVE_MODE
         s = Settings()
         if a.live or not s.mock_mode:
             LIVE_MODE = True
@@ -235,7 +367,6 @@ def main(argv=None) -> int:
                 print("━━ Modo LIVE detectado: ejecutando flujo 'happy' contra PayPal Sandbox real y tasa real")
                 a.scenario = "happy"
         if a.llm:
-            global BRAIN
             from .agents import AgentBrain
             BRAIN = AgentBrain(s)
     if a.cmd == "errors":
@@ -244,6 +375,12 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "live-check":
         return live_check()
+    if a.cmd == "chat":
+        s = Settings()
+        if a.live or not s.mock_mode:
+            LIVE_MODE = True
+        interactive_chat()
+        return 0
     if a.cmd == "serve":
         import uvicorn
         print(f"━━ Iniciando servidor de webhooks y scheduler en http://{a.host}:{a.port}")

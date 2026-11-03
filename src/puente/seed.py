@@ -34,4 +34,16 @@ def seed(conn: sqlite3.Connection) -> None:
             "INSERT INTO providers (display_name, paypal_email, paypal_verified, kyc_level, status, completed_orders,"
             " disputed_orders, failed_orders, avg_settle_minutes, usd_capacity_available, margin_pct, fee_usd,"
             " accepts_banks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (*r, banks))
+
+    # Cuentas de Pago Móvil de los proveedores
+    conn.executemany(
+        "INSERT INTO provider_payout_accounts (provider_id, method, bank_code, phone, id_doc, holder_name, active)"
+        " VALUES (?,?,?,?,?,?,?)",
+        [
+            (1, "pago_movil", "0102", "0412-1112233", "V-20111222", "Alejandro Pérez (Prov A)", 1),
+            (2, "pago_movil", "0102", "0414-9988776", "V-15888999", "Carlos Gómez (Prov B)", 1),
+            (2, "pago_movil", "0134", "0414-9988776", "V-15888999", "Carlos Gómez (Prov B)", 1),
+            (3, "pago_movil", "0102", "0416-5554433", "V-12333444", "Daniela Rivas (Prov C)", 1),
+        ]
+    )
     conn.commit()

@@ -34,6 +34,19 @@ CREATE TABLE IF NOT EXISTS providers (
   created_at             TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Cuentas de cobro / Pago Móvil registradas por los proveedores de liquidez
+CREATE TABLE IF NOT EXISTS provider_payout_accounts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider_id  INTEGER NOT NULL REFERENCES providers(id),
+  method       TEXT NOT NULL DEFAULT 'pago_movil',
+  bank_code    TEXT NOT NULL,                       -- ej. '0102' (Banco de Venezuela)
+  phone        TEXT NOT NULL,                       -- ej. '0414-1234567'
+  id_doc       TEXT NOT NULL,                       -- ej. 'V-18765432'
+  holder_name  TEXT NOT NULL,                       -- ej. 'Carlos Gómez'
+  active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Comercio real al que se le paga con PayPal (en el demo: cuenta SANDBOX business).
 CREATE TABLE IF NOT EXISTS merchants (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,10 +131,12 @@ CREATE TABLE IF NOT EXISTS paypal_orders (
   request_id           INTEGER NOT NULL REFERENCES purchase_requests(id),
   provider_id          INTEGER NOT NULL REFERENCES providers(id),
   kind                 TEXT NOT NULL DEFAULT 'order' CHECK (kind IN ('order','invoice')),
+  intent               TEXT NOT NULL DEFAULT 'CAPTURE',
   paypal_order_id      TEXT UNIQUE,
   paypal_invoice_id    TEXT,
   invoice_number       TEXT,
   invoice_url          TEXT,
+  authorization_id     TEXT,
   status               TEXT NOT NULL,              -- CREATED/APPROVED/COMPLETED/REFUNDED...
   approve_url          TEXT,
   capture_id           TEXT,

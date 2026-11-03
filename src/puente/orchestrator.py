@@ -320,6 +320,123 @@ class Orchestrator:
         return StepResult(True, S.AWAITING_DELIVERY, "Pago confirmado. Esperando entrega.", None,
                           {"capture_id": cap.get("capture_id")})
 
+    # ───────────────────────── 3.1 P2P Escrow (AUTHORIZE + Ticket + Release) ─────────────────────────
+    def create_escrow_order(self, rid: int) -> StepResult:
+        """Crea la orden de PayPal con 'intent': 'AUTHORIZE' para bloquear los fondos del proveedor."""
+        req = self._req(rid)
+        q = self._row("SELECT * FROM quotes WHERE id=?", req["selected_quote_id"])
+        item = self._row("SELECT * FROM catalog_items WHERE id=?", req["item_id"])
+        existing = self._row("SELECT * FROM paypal_orders WHERE request_id=? AND status IN ('CREATED','APPROVED','AUTHORIZED')", rid)
+        if existing:
+            return StepResult(True, req["state"], "Orden de custodia existente.", None,
+                              {"paypal_order_id": existing["paypal_order_id"], "approve_url": existing["approve_url"]})
+        try:
+            out = self._paypal_call(rid, lambda: self.gw.create_authorize_order(
+                amount_usd=req["amount_usd"], item_name=item["title"], reference_id=f"ESCROW-{rid}"))
+        except StepFailure as sf:
+            return self._apply_failure(rid, sf.resolution)
+        self.conn.execute(
+            "INSERT INTO paypal_orders (request_id, provider_id, kind, intent, paypal_order_id, status, approve_url,"
+            " amount_usd, created_at, raw_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rid, q["provider_id"], "order", "AUTHORIZE", out["order_id"], "CREATED", out.get("approve_url"),
+             req["amount_usd"], iso(self.clock()), json.dumps(out.get("raw"), default=str)))
+        self.conn.execute("UPDATE providers SET usd_capacity_available = usd_capacity_available - ? WHERE id=?",
+                          (req["amount_usd"], q["provider_id"]))
+        self.conn.commit()
+        self._to(rid, S.PAYPAL_ORDER_CREATED, payload={"paypal_order_id": out["order_id"], "intent": "AUTHORIZE"})
+        self._to(rid, S.AWAITING_PROVIDER_APPROVAL)
+        return StepResult(True, S.AWAITING_PROVIDER_APPROVAL, "El proveedor debe aprobar la retención en PayPal.",
+                          None, {"paypal_order_id": out["order_id"], "approve_url": out.get("approve_url")})
+
+    def lock_usd_escrow(self, rid: int) -> StepResult:
+        """El proveedor aprobó en PayPal: autorizamos la orden (USD retenidos en custodia)."""
+        req = self._req(rid)
+        o = self._row("SELECT * FROM paypal_orders WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
+        oid = o["paypal_order_id"]
+        try:
+            auth = self._paypal_call(rid, lambda: self.gw.authorize_order(oid))
+        except StepFailure as sf:
+            return self._apply_failure(rid, sf.resolution)
+        auth_id = auth.get("authorization_id")
+        self.conn.execute("UPDATE paypal_orders SET authorization_id=?, status='AUTHORIZED' WHERE id=?",
+                          (auth_id, o["id"]))
+        self.conn.commit()
+        self._to(rid, S.USD_ESCROW_LOCKED, payload={"authorization_id": auth_id})
+        ticket = self.get_pago_movil_ticket(rid)
+        return StepResult(True, S.USD_ESCROW_LOCKED, "Dólares bloqueados en PayPal. Proceda al Pago Móvil.",
+                          None, {"ticket": ticket, "authorization_id": auth_id})
+
+    def get_pago_movil_ticket(self, rid: int) -> dict:
+        """Devuelve el ticket con los datos exactos del Pago Móvil del proveedor."""
+        req = self._req(rid)
+        q = self._row("SELECT * FROM quotes WHERE id=?", req["selected_quote_id"])
+        prov = self._row("SELECT * FROM providers WHERE id=?", q["provider_id"])
+        account = self._row(
+            "SELECT * FROM provider_payout_accounts WHERE provider_id=? AND bank_code=? AND active=1",
+            prov["id"], req["customer_bank"])
+        if not account:
+            account = self._row(
+                "SELECT * FROM provider_payout_accounts WHERE provider_id=? AND active=1 ORDER BY id ASC LIMIT 1",
+                prov["id"])
+        bank_names = {"0102": "Banco de Venezuela", "0105": "Banco Mercantil", "0108": "Banco Provincial", "0134": "Banesco"}
+        b_code = account["bank_code"] if account else (req["customer_bank"] or "0102")
+        b_name = bank_names.get(b_code, f"Banco {b_code}")
+        o = self._row("SELECT authorization_id FROM paypal_orders WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
+        return {
+            "request_id": rid,
+            "provider_name": prov["display_name"],
+            "bank_code": b_code,
+            "bank_name": b_name,
+            "phone": account["phone"] if account else "0414-9988776",
+            "id_doc": account["id_doc"] if account else "V-15888999",
+            "holder_name": account["holder_name"] if account else prov["display_name"],
+            "total_ves": q["total_ves"],
+            "concept_code": f"PUENTE-{rid}",
+            "usd_locked": True,
+            "authorization_id": o["authorization_id"] if o else None,
+            "expires_at": q["expires_at"],
+        }
+
+    def provider_release_and_capture(self, rid: int) -> StepResult:
+        """El proveedor confirma 'recibí los Bolívares' (botón estilo Binance): capturamos la retención USD."""
+        req = self._req(rid)
+        o = self._row("SELECT * FROM paypal_orders WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
+        auth_id = o["authorization_id"] if o else None
+        if not auth_id:
+            raise ValueError("No hay fondos autorizados para capturar.")
+        try:
+            cap = self._paypal_call(rid, lambda: self.gw.capture_authorization(auth_id, amount_usd=req["amount_usd"]))
+        except StepFailure as sf:
+            return self._apply_failure(rid, sf.resolution)
+        self.conn.execute("UPDATE paypal_orders SET capture_id=?, status='COMPLETED', captured_at=? WHERE id=?",
+                          (cap.get("capture_id"), iso(self.clock()), o["id"]))
+        self.conn.execute("UPDATE providers SET completed_orders = completed_orders + 1 WHERE id=?", (o["provider_id"],))
+        merchant = self._row("SELECT delivery_type FROM merchants WHERE id=?", req["merchant_id"])
+        self.conn.execute("INSERT INTO deliveries (request_id, delivery_type, deadline_at) VALUES (?,?,?)",
+                          (rid, merchant["delivery_type"],
+                           iso(self.clock() + timedelta(hours=self.s.delivery_deadline_hours))))
+        self.conn.commit()
+        self._to(rid, S.PAID, payload={"capture_id": cap.get("capture_id")})
+        self._to(rid, S.AWAITING_DELIVERY)
+        return StepResult(True, S.AWAITING_DELIVERY, "Fondos liberados al comercio. Esperando entrega digital.",
+                          None, {"capture_id": cap.get("capture_id")})
+
+    def cancel_escrow(self, rid: int) -> StepResult:
+        """Si el comprador no paga en VES o se vence el plazo, se anula la retención (void) sin pérdida."""
+        o = self._row("SELECT * FROM paypal_orders WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
+        if o and o["authorization_id"]:
+            try:
+                self.gw.void_authorization(o["authorization_id"])
+            except Exception:
+                pass
+            self.conn.execute("UPDATE paypal_orders SET status='VOIDED' WHERE id=?", (o["id"],))
+        req = self._req(rid)
+        self.conn.execute("UPDATE providers SET usd_capacity_available = usd_capacity_available + ? WHERE id=?",
+                          (req["amount_usd"], o["provider_id"] if o else 1))
+        self.conn.commit()
+        self._to(rid, S.EXPIRED, event_type="escrow_cancelled")
+        return StepResult(True, S.EXPIRED, "Custodia cancelada: dólares liberados de nuevo al proveedor.")
+
     def create_paypal_invoice(self, rid: int) -> StepResult:
         """Crea y envía una factura de PayPal para la solicitud (vía Invoicing v2)."""
         req = self._req(rid)

@@ -62,6 +62,66 @@ def test_invoice_flow_completes():
     assert conn.execute("SELECT kind, status FROM paypal_orders WHERE request_id=?", (rid,)).fetchone()["kind"] == "invoice"
 
 
+def test_p2p_escrow_binance_flow_happy():
+    """P2P con Escrow (Binance-grade): retener USD -> ticket Pago Móvil -> pagar Bs -> liberar."""
+    conn, orch, gw, _ = build()
+    rid = quote_and_select(orch, key="k-escrow", item=1)
+    pid = orch._row("SELECT provider_id FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)["provider_id"]
+    cap_before = conn.execute("SELECT usd_capacity_available FROM providers WHERE id=?", (pid,)).fetchone()["usd_capacity_available"]
+
+    # 1. Crear orden con intent AUTHORIZE (USD en espera de retención)
+    escrow_res = orch.create_escrow_order(rid)
+    assert escrow_res.ok
+    assert escrow_res.state == S.AWAITING_PROVIDER_APPROVAL
+    oid = escrow_res.data["paypal_order_id"]
+
+    # 2. El proveedor aprueba en PayPal Sandbox
+    gw.approve(oid)
+
+    # 3. El agente autoriza la orden: USD bloqueados en PayPal y emite el Ticket de Pago Móvil
+    lock_res = orch.lock_usd_escrow(rid)
+    assert lock_res.ok
+    assert lock_res.state == S.USD_ESCROW_LOCKED
+    ticket = lock_res.data["ticket"]
+    assert ticket["usd_locked"] is True
+    assert ticket["bank_code"] == "0102"
+    assert "0414" in ticket["phone"] or "0412" in ticket["phone"]
+    assert ticket["concept_code"] == f"PUENTE-{rid}"
+
+    # 4. El cliente envía el Pago Móvil con su referencia bancaria
+    assert orch.confirm_ves(rid, "REF-PAGOMOVIL-7788", ticket["total_ves"]).ok
+
+    # 5. El proveedor confirma que recibió los Bs. (botón de Binance) -> PUENTE captura los USD
+    release_res = orch.provider_release_and_capture(rid)
+    assert release_res.ok
+    assert release_res.state == S.AWAITING_DELIVERY
+
+    # 6. Entrega digital y confirmación del cliente
+    assert orch.record_delivery(rid, proof="LICENCIA-ESCROW-XYZ", delivered=True).state == S.DELIVERED
+    assert orch.confirm_receipt(rid).state == S.COMPLETED
+
+    # 7. Verificar que los USD se debitaron de la capacidad del proveedor
+    cap_after = conn.execute("SELECT usd_capacity_available, completed_orders FROM providers WHERE id=?", (pid,)).fetchone()
+    assert cap_after["usd_capacity_available"] == cap_before - 29.0
+    assert cap_after["completed_orders"] >= 1
+
+
+def test_p2p_escrow_cancel_restores_capacity():
+    """Si el cliente no paga los Bs., se anula la retención (void) y se restaura el saldo al proveedor."""
+    conn, orch, gw, _ = build()
+    rid = quote_and_select(orch, key="k-cancel", item=1)
+    pid = orch._row("SELECT provider_id FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)["provider_id"]
+    cap_before = conn.execute("SELECT usd_capacity_available FROM providers WHERE id=?", (pid,)).fetchone()["usd_capacity_available"]
+
+    orch.create_escrow_order(rid)
+    cancel_res = orch.cancel_escrow(rid)
+    assert cancel_res.ok
+    assert cancel_res.state == S.EXPIRED
+
+    cap_after = conn.execute("SELECT usd_capacity_available FROM providers WHERE id=?", (pid,)).fetchone()["usd_capacity_available"]
+    assert cap_after == cap_before
+
+
 # ---------- idempotencia ----------
 def test_idempotent_request_and_capture():
     _, orch, gw, _ = build()

@@ -62,6 +62,14 @@ class PayPalGateway(ABC):
     def send_invoice(self, invoice_id: str) -> dict: ...
     @abstractmethod
     def get_invoice(self, invoice_id: str) -> dict: ...
+    @abstractmethod
+    def create_authorize_order(self, *, amount_usd: float, item_name: str, reference_id: str) -> dict: ...
+    @abstractmethod
+    def authorize_order(self, order_id: str) -> dict: ...
+    @abstractmethod
+    def capture_authorization(self, authorization_id: str, *, amount_usd: float | None = None) -> dict: ...
+    @abstractmethod
+    def void_authorization(self, authorization_id: str) -> dict: ...
 
 
 # ───────────────────────── REST directo (refund / tracking / disputas) ─────────────────────────
@@ -223,6 +231,64 @@ class LivePayPal(PayPalGateway):
         return self.rest.request("POST", f"/v1/customer/disputes/{dispute_id}/accept-claim",
                                  json_body={"note": note[:2000]})
 
+    def create_authorize_order(self, *, amount_usd: float, item_name: str, reference_id: str) -> dict:
+        body = {
+            "intent": "AUTHORIZE",
+            "purchase_units": [{
+                "reference_id": reference_id,
+                "description": item_name[:127],
+                "amount": {
+                    "currency_code": "USD",
+                    "value": f"{amount_usd:.2f}"
+                }
+            }]
+        }
+        out = self.rest.request("POST", "/v2/checkout/orders", json_body=body, request_id=f"order-auth-{reference_id}")
+        links = {l.get("rel"): l.get("href") for l in out.get("links", [])}
+        return {
+            "order_id": out["id"],
+            "status": out.get("status"),
+            "approve_url": links.get("payer-action") or links.get("approve"),
+            "intent": "AUTHORIZE",
+            "raw": out
+        }
+
+    def authorize_order(self, order_id: str) -> dict:
+        out = self.rest.request("POST", f"/v2/checkout/orders/{order_id}/authorize",
+                                request_id=f"auth-{order_id}", json_body={})
+        units = out.get("purchase_units") or [{}]
+        authorizations = (units[0].get("payments") or {}).get("authorizations") or [{}]
+        auth_id = authorizations[0].get("id") if authorizations else None
+        auth_status = authorizations[0].get("status") if authorizations else None
+        return {
+            "order_id": order_id,
+            "authorization_id": auth_id,
+            "status": auth_status or out.get("status"),
+            "raw": out
+        }
+
+    def capture_authorization(self, authorization_id: str, *, amount_usd: float | None = None) -> dict:
+        body = {}
+        if amount_usd is not None:
+            body = {"amount": {"currency_code": "USD", "value": f"{amount_usd:.2f}"}}
+        out = self.rest.request("POST", f"/v2/payments/authorizations/{authorization_id}/capture",
+                                request_id=f"cap-auth-{authorization_id}", json_body=body)
+        return {
+            "authorization_id": authorization_id,
+            "capture_id": out.get("id"),
+            "status": out.get("status"),
+            "raw": out
+        }
+
+    def void_authorization(self, authorization_id: str) -> dict:
+        out = self.rest.request("POST", f"/v2/payments/authorizations/{authorization_id}/void",
+                                request_id=f"void-{authorization_id}", json_body={})
+        return {
+            "authorization_id": authorization_id,
+            "status": out.get("status", "VOIDED"),
+            "raw": out
+        }
+
 
 def _safe_json_requests(resp) -> Any:
     try:
@@ -343,3 +409,35 @@ class MockPayPal(PayPalGateway):
         inv = self.invoices.get(invoice_id)
         if inv:
             inv["status"] = "PAID"
+
+    def create_authorize_order(self, *, amount_usd, item_name, reference_id):
+        self._enter("create_authorize_order", amount_usd=amount_usd)
+        self._n += 1
+        oid = f"MOCK-ORDER-AUTH-{self._n}"
+        self.orders[oid] = {
+            "status": "CREATED", "amount": amount_usd, "intent": "AUTHORIZE",
+            "authorization_id": None, "capture_id": None, "capture_status": None
+        }
+        return {"order_id": oid, "status": "CREATED", "intent": "AUTHORIZE",
+                "approve_url": f"https://www.sandbox.paypal.com/checkoutnow?token={oid}"}
+
+    def authorize_order(self, order_id):
+        self._enter("authorize_order", order_id=order_id)
+        o = self.orders.get(order_id)
+        if o is None:
+            raise PayPalError(404, "RESOURCE_NOT_FOUND", "INVALID_RESOURCE_ID")
+        if o["status"] != "APPROVED":
+            raise PayPalError(422, "UNPROCESSABLE_ENTITY", "ORDER_NOT_APPROVED")
+        auth_id = f"MOCK-AUTH-{order_id}"
+        o["status"] = "AUTHORIZED"
+        o["authorization_id"] = auth_id
+        return {"order_id": order_id, "authorization_id": auth_id, "status": "CREATED"}
+
+    def capture_authorization(self, authorization_id, *, amount_usd=None):
+        self._enter("capture_authorization", authorization_id=authorization_id)
+        cap_id = f"MOCK-CAP-{authorization_id}"
+        return {"authorization_id": authorization_id, "capture_id": cap_id, "status": "COMPLETED"}
+
+    def void_authorization(self, authorization_id):
+        self._enter("void_authorization", authorization_id=authorization_id)
+        return {"authorization_id": authorization_id, "status": "VOIDED"}

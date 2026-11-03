@@ -61,7 +61,11 @@ def build(brain=None, settings: Settings | None = None, mock: bool | None = None
         gw = LivePayPal(s.paypal_client_id, s.paypal_secret, sandbox=s.paypal_sandbox)
         fetcher = http_fetcher(s.fx_url, s.fx_json_path) if s.fx_url else mock_fetcher(40.0)
         sleep_fn = time.sleep
-    orch = Orchestrator(conn, gw, s, fetcher, brain=brain or BRAIN, sleep=sleep_fn,
+    active_brain = brain or BRAIN
+    if active_brain is None and not is_mock and (s.gemini_api_key or s.openai_api_key):
+        from .agents import AgentBrain
+        active_brain = AgentBrain(s)
+    orch = Orchestrator(conn, gw, s, fetcher, brain=active_brain, sleep=sleep_fn,
                         clock=clock, **orch_kw)
     return conn, orch, gw, clock
 

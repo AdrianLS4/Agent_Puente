@@ -122,53 +122,174 @@ def fallback_explain_quotes(quotes: list[dict]) -> str:
     return msg
 
 
+class GeminiClient:
+    """Cliente para la API de Google Gemini (vía REST nativo)."""
+
+    def __init__(self, api_key: str, model: str = "gemini-flash-lite-latest"):
+        self.api_key = api_key
+        self.model = model
+        self.url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    def generate(self, prompt: str, *, system_instruction: str = "", response_json: bool = False) -> str:
+        import requests
+
+        body: dict[str, Any] = {
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        if system_instruction:
+            body["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+        if response_json:
+            body["generationConfig"] = {"responseMimeType": "application/json"}
+
+        r = requests.post(self.url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text}")
+
+
 class AgentBrain:
-    """Implementa el protocolo `Brain` del orquestador usando el Agents SDK con fallback resiliente."""
+    """Implementa el protocolo `Brain` del orquestador usando Gemini o OpenAI con fallback resiliente."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.intake = None
-        self.sourcing = None
-        self.resolution = None
+        self.gemini = None
+        self.openai_client = None
 
-        if settings.openai_api_key:
+        # 1. Si hay clave de Gemini (o OPENAI_API_KEY empieza con AIza), usar Gemini
+        gemini_key = settings.gemini_api_key or (settings.openai_api_key if settings.openai_api_key.startswith("AIza") else "")
+        if gemini_key:
             try:
-                from agents import Agent  # import perezoso
-                self.intake = Agent(name="Intake", instructions=INTAKE_INSTRUCTIONS,
-                                    model=settings.openai_model, output_type=PurchaseIntent)
-                self.sourcing = Agent(name="Sourcing", instructions=SOURCING_INSTRUCTIONS, model=settings.openai_model)
-                self.resolution = Agent(name="Resolution", instructions=RESOLUTION_INSTRUCTIONS,
-                                        model=settings.openai_model, output_type=DisputeDecision)
+                self.gemini = GeminiClient(gemini_key, settings.gemini_model or "gemini-flash-lite-latest")
+            except Exception:
+                pass
+
+        # 2. Si hay clave de OpenAI estándar
+        if not self.gemini and settings.openai_api_key:
+            try:
+                from openai import OpenAI
+                kw = {"api_key": settings.openai_api_key}
+                if settings.openai_base_url:
+                    kw["base_url"] = settings.openai_base_url
+                self.openai_client = OpenAI(**kw)
             except Exception:
                 pass
 
     def parse_intent(self, text: str) -> PurchaseIntent:
-        if self.intake and self.settings.openai_api_key:
+        # Vía Gemini
+        if self.gemini:
             try:
-                from agents import Runner
-                return Runner.run_sync(self.intake, text).final_output
+                sys_prompt = (
+                    "Eres el agente de recepción de PUENTE. Extrae en formato JSON exacto: "
+                    "'amount_usd' (float o null), 'customer_bank' (str código 4 dígitos ej '0102' para Venezuela o null), "
+                    "'merchant_hint' (str o null), 'item_description' (str). Devuelve ÚNICAMENTE el JSON."
+                )
+                raw = self.gemini.generate(text, system_instruction=sys_prompt, response_json=True)
+                d = json.loads(raw)
+                return PurchaseIntent(
+                    item_description=d.get("item_description") or text.strip(),
+                    amount_usd=float(d["amount_usd"]) if d.get("amount_usd") else None,
+                    merchant_hint=d.get("merchant_hint"),
+                    customer_bank=d.get("customer_bank"),
+                    urgency="normal",
+                )
             except Exception:
                 pass
+
+        # Vía OpenAI
+        if self.openai_client:
+            try:
+                resp = self.openai_client.chat.completions.create(
+                    model=self.settings.openai_model,
+                    messages=[
+                        {"role": "system", "content": INTAKE_INSTRUCTIONS},
+                        {"role": "user", "content": text}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                d = json.loads(resp.choices[0].message.content)
+                return PurchaseIntent(
+                    item_description=d.get("item_description") or text.strip(),
+                    amount_usd=float(d["amount_usd"]) if d.get("amount_usd") else None,
+                    merchant_hint=d.get("merchant_hint"),
+                    customer_bank=d.get("customer_bank"),
+                    urgency="normal",
+                )
+            except Exception:
+                pass
+
         return fallback_parse_intent(text)
 
     def explain_quotes(self, quotes: list[dict]) -> str:
-        if self.sourcing and self.settings.openai_api_key:
+        # Vía Gemini
+        if self.gemini:
             try:
-                from agents import Runner
-                return str(Runner.run_sync(self.sourcing, json.dumps(quotes, default=str)).final_output)
+                raw = self.gemini.generate(
+                    json.dumps(quotes, default=str),
+                    system_instruction=SOURCING_INSTRUCTIONS
+                )
+                if raw:
+                    return raw
             except Exception:
                 pass
+
+        # Vía OpenAI
+        if self.openai_client:
+            try:
+                resp = self.openai_client.chat.completions.create(
+                    model=self.settings.openai_model,
+                    messages=[
+                        {"role": "system", "content": SOURCING_INSTRUCTIONS},
+                        {"role": "user", "content": json.dumps(quotes, default=str)}
+                    ]
+                )
+                if resp.choices[0].message.content:
+                    return resp.choices[0].message.content.strip()
+            except Exception:
+                pass
+
         return fallback_explain_quotes(quotes)
 
     def decide_dispute(self, ctx: dict, allowed: set[str]) -> dict:
-        if self.resolution and self.settings.openai_api_key:
+        # Vía Gemini
+        if self.gemini:
             try:
-                from agents import Runner
-                payload = json.dumps({"case": ctx, "allowed": sorted(allowed)})
-                out: DisputeDecision = Runner.run_sync(self.resolution, payload).final_output
-                return {"decision": out.decision, "rationale_es": out.rationale_es, "confidence": out.confidence}
+                prompt = json.dumps({"case": ctx, "allowed": sorted(allowed)}, default=str)
+                raw = self.gemini.generate(
+                    prompt,
+                    system_instruction=RESOLUTION_INSTRUCTIONS + " Responde en JSON: {'decision': 'contest'|'accept'|'human', 'rationale_es': str, 'confidence': float}.",
+                    response_json=True
+                )
+                d = json.loads(raw)
+                return {
+                    "decision": d.get("decision", "human"),
+                    "rationale_es": d.get("rationale_es", "Evaluado por Gemini."),
+                    "confidence": float(d.get("confidence", 0.9))
+                }
             except Exception:
                 pass
+
+        # Vía OpenAI
+        if self.openai_client:
+            try:
+                prompt = json.dumps({"case": ctx, "allowed": sorted(allowed)}, default=str)
+                resp = self.openai_client.chat.completions.create(
+                    model=self.settings.openai_model,
+                    messages=[
+                        {"role": "system", "content": RESOLUTION_INSTRUCTIONS + " Responde en JSON: {'decision': '...', 'rationale_es': '...', 'confidence': 0.0-1.0}."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                d = json.loads(resp.choices[0].message.content)
+                return {
+                    "decision": d.get("decision", "human"),
+                    "rationale_es": d.get("rationale_es", "Evaluado por LLM."),
+                    "confidence": float(d.get("confidence", 0.9))
+                }
+            except Exception:
+                pass
+
         # Fallback de resolución según reglas
         if "contest" in allowed:
             return {"decision": "contest", "rationale_es": "Existe prueba de entrega digital registrada en la cadena.", "confidence": 0.95}

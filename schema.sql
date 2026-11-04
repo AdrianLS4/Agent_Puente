@@ -58,11 +58,12 @@ CREATE TABLE IF NOT EXISTS merchants (
 );
 
 CREATE TABLE IF NOT EXISTS catalog_items (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  merchant_id INTEGER NOT NULL REFERENCES merchants(id),
-  title       TEXT NOT NULL,
-  price_usd   REAL NOT NULL CHECK (price_usd > 0),
-  active      INTEGER NOT NULL DEFAULT 1
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  merchant_id  INTEGER NOT NULL REFERENCES merchants(id),
+  title        TEXT NOT NULL,
+  price_usd    REAL NOT NULL CHECK (price_usd > 0),
+  billing_kind TEXT NOT NULL DEFAULT 'one_off' CHECK (billing_kind IN ('one_off','recurring')),
+  active       INTEGER NOT NULL DEFAULT 1
 );
 
 -- ───────────── Tasa de cambio ─────────────

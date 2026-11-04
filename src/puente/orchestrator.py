@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -128,7 +129,8 @@ class Orchestrator:
 
     # ───────────────────────── 1. Solicitud y cotización ─────────────────────────
     def create_request(self, customer_id: int, item_id: int, bank: str | None, idempotency_key: str,
-                       *, parent_request_id: int | None = None, excluded: list[int] | None = None) -> StepResult:
+                       *, parent_request_id: int | None = None, excluded: list[int] | None = None,
+                       flow: str | None = None) -> StepResult:
         dup = self._row("SELECT id, state FROM purchase_requests WHERE idempotency_key=?", idempotency_key)
         if dup:
             res = resolve("E_IDEMPOTENT_REPLAY")
@@ -136,6 +138,9 @@ class Orchestrator:
         item = self._row("SELECT * FROM catalog_items WHERE id=? AND active=1", item_id)
         if item is None:
             raise ValueError(f"item {item_id} no existe")
+        b_kind = item["billing_kind"] if "billing_kind" in item.keys() else "one_time"
+        if b_kind == "recurring" or "mensual" in item["title"].lower():
+            return StepResult(False, S.CREATED, "Cobros recurrentes no soportados actualmente.", "E_RECURRING_UNSUPPORTED")
         if item["price_usd"] > self.s.max_amount_usd:
             res = resolve("E_AMOUNT_LIMIT")
             self._log_error(None, res, 0, {"amount": item["price_usd"]})
@@ -495,6 +500,84 @@ class Orchestrator:
         self.conn.commit()
         self._to(rid, S.EXPIRED, event_type="escrow_cancelled")
         return StepResult(True, S.EXPIRED, "Custodia cancelada: dólares liberados de nuevo al proveedor.")
+
+    def select_quote_p2p(self, rid: int, rank: int = 1) -> StepResult:
+        """Selecciona cotización y crea orden de retención en PayPal para flujo P2P."""
+        sel = self.select_quote(rid, rank)
+        if not sel.ok:
+            return sel
+        escrow = self.create_escrow_order(rid)
+        if not escrow.ok:
+            return escrow
+        oid = escrow.data.get("paypal_order_id")
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'provider', ?)",
+            (rid, f"El cliente confirmó la cotización #{rank}. Por favor aprueba la orden en PayPal Sandbox (ID: {oid}).")
+        )
+        self.conn.commit()
+        return StepResult(True, S.AWAITING_PROVIDER_APPROVAL, f"Cotización #{rank} confirmada. Orden creada en PayPal.",
+                          None, {"paypal_order_id": oid})
+
+    def on_provider_locked(self, rid: int) -> StepResult:
+        """Verifica si el proveedor aprobó la orden en PayPal y emite los datos de Pago Móvil en outbox."""
+        o = self._row("SELECT * FROM paypal_orders WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
+        if not o:
+            return StepResult(False, S.CREATED, "No hay orden de PayPal asociada.", "E_NO_PAYPAL_ORDER")
+        oid = o["paypal_order_id"]
+        try:
+            order_data = self.gw.get_order(oid)
+        except Exception:
+            order_data = {"status": "UNKNOWN"}
+
+        status = order_data.get("status", "")
+        if status in ("APPROVED", "COMPLETED", "AUTHORIZED"):
+            req = self._req(rid)
+            if req["state"] in (S.AWAITING_PROVIDER_APPROVAL, S.PAYPAL_ORDER_CREATED):
+                try:
+                    self.lock_usd_escrow(rid)
+                except Exception:
+                    pass
+                self._to(rid, S.AWAITING_VES)
+
+            ticket = self.get_pago_movil_ticket(rid)
+            phone_clean = re.sub(r"\D", "", ticket["phone"])
+            body = (
+                f"El proveedor ya bloqueó tu pago en PayPal. Ahora paga EXACTAMENTE Bs. {ticket['total_ves']:,.2f} "
+                f"por Pago Móvil a:\n"
+                f"  • Banco: {ticket['bank_name']} ({ticket['bank_code']})\n"
+                f"  • Teléfono: {ticket['phone']} ({phone_clean})\n"
+                f"  • Cédula/RIF: {ticket['id_doc']}\n"
+                f"  • Titular: {ticket['holder_name']}\n"
+                f"  • Monto: {ticket['total_ves']:,.2f} Bs.\n"
+                f"  • Concepto: {ticket['concept_code']}\n"
+                f"Tienes 30 min. Luego envía el número de referencia del comprobante."
+            )
+            already = self.conn.execute("SELECT id FROM outbox WHERE request_id=? AND to_role='customer'", (rid,)).fetchone()
+            if not already:
+                self.conn.execute("INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'customer', ?)",
+                                  (rid, body))
+                self.conn.commit()
+            return StepResult(True, S.AWAITING_VES, "Dólares retenidos en PayPal. Instrucciones emitidas.", None, {"ticket": ticket})
+        return StepResult(False, S.AWAITING_PROVIDER_APPROVAL, "El proveedor todavía no aprueba la orden en PayPal.", "E_NOT_APPROVED")
+
+    def report_ves_payment(self, rid: int, bank_reference: str, amount_ves: float) -> StepResult:
+        res = self.confirm_ves(rid, bank_reference, amount_ves)
+        if not res.ok:
+            return res
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'provider', ?)",
+            (rid, f"El cliente reportó el Pago Móvil (Ref: {bank_reference}) por Bs. {amount_ves:,.2f}. Verifica y confirma.")
+        )
+        self.conn.commit()
+        return StepResult(True, "VES_REPORTED", f"Pago Móvil registrado con referencia {bank_reference}.", "OK")
+
+    def provider_confirm_ves(self, rid: int, provider_id: int) -> StepResult:
+        res = self.provider_release_and_capture(rid)
+        if not res.ok:
+            return res
+        self.record_delivery(rid, proof="LICENCIA-PUENTE-P2P", delivered=True)
+        self.confirm_receipt(rid)
+        return StepResult(True, S.COMPLETED, "Bolívares confirmados, dólares capturados y entrega completada.", "OK")
 
     def create_paypal_invoice(self, rid: int) -> StepResult:
         """Crea y envía una factura de PayPal para la solicitud (vía Invoicing v2)."""

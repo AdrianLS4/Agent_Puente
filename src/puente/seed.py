@@ -15,10 +15,10 @@ def seed(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO merchants (name, paypal_merchant_id, category, delivery_type)"
                  " VALUES ('TiendaTech Demo','SANDBOX-MERCHANT','electronics','physical')")
     conn.executemany("INSERT INTO catalog_items (merchant_id, title, price_usd, billing_kind) VALUES (?,?,?,?)", [
-        (1, "Curso de Python (licencia anual)", 29.0, "one_off"),
-        (1, "Suscripción SaaS (1 año)", 120.0, "one_off"),
+        (1, "Curso de Python (licencia anual)", 29.0, "one_time"),
+        (1, "Suscripción SaaS (1 año)", 120.0, "one_time"),
         (1, "Plan Mensual Demo (recurrente)", 15.0, "recurring"),
-        (2, "Teclado mecánico", 45.0, "one_off"),
+        (2, "Teclado mecánico", 45.0, "one_time"),
     ])
     # Bancos soportados: Venezuela, Mercantil, Provincial, Banesco, Banco Activo, Bancamiga, BNC, etc.
     banks = json.dumps(["0102", "0104", "0105", "0108", "0114", "0115", "0134", "0151", "0163", "0166", "0168", "0169", "0171", "0172", "0174", "0175", "0177", "0191"])

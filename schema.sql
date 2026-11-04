@@ -62,8 +62,17 @@ CREATE TABLE IF NOT EXISTS catalog_items (
   merchant_id  INTEGER NOT NULL REFERENCES merchants(id),
   title        TEXT NOT NULL,
   price_usd    REAL NOT NULL CHECK (price_usd > 0),
-  billing_kind TEXT NOT NULL DEFAULT 'one_off' CHECK (billing_kind IN ('one_off','recurring')),
+  billing_kind TEXT NOT NULL DEFAULT 'one_time' CHECK (billing_kind IN ('one_time','recurring')),
   active       INTEGER NOT NULL DEFAULT 1
+);
+
+-- Buzón de mensajes de la aplicación para pantalla (Pago Móvil, instrucciones directas)
+CREATE TABLE IF NOT EXISTS outbox (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id  INTEGER REFERENCES purchase_requests(id),
+  to_role     TEXT NOT NULL CHECK (to_role IN ('customer','provider','merchant','admin')),
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ───────────── Tasa de cambio ─────────────

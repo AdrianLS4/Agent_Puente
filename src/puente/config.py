@@ -48,6 +48,7 @@ class Settings:
     delivery_deadline_hours: int = 24
     auto_complete_hours: int = 72
     max_provider_failovers: int = 2
+    lock_mode: str = os.getenv("LOCK_MODE", "authorize")
 
     # Disputas: tope de lo que el agente puede decidir SOLO.
     dispute_auto_max_usd: float = field(default_factory=lambda: _f("DISPUTE_AUTO_MAX_USD", 50))

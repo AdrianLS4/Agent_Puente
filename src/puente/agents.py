@@ -57,7 +57,7 @@ OPS_INSTRUCTIONS = (
 
 
 def fallback_parse_intent(text: str) -> PurchaseIntent:
-    """Extractor de lenguaje natural determinista y robusto (funciona con o sin OpenAI)."""
+    """Extractor de lenguaje natural determinista y robusto (funciona con o sin OpenAI/Gemini)."""
     import re
     lower = text.lower()
 
@@ -100,9 +100,22 @@ def fallback_parse_intent(text: str) -> PurchaseIntent:
         merchant_hint = "SaaS"
     elif "teclado" in lower or "tech" in lower or "mecanico" in lower or "mecánico" in lower:
         merchant_hint = "TiendaTech"
+    elif "riot" in lower or "valorant" in lower or "league" in lower or "lol" in lower:
+        merchant_hint = "Riot Games"
+    elif "steam" in lower:
+        merchant_hint = "Steam"
+    elif "amazon" in lower:
+        merchant_hint = "Amazon"
+
+    # Limpiar descripción extrayendo solo el producto
+    clean = re.sub(r"\b(hola|buen[oa]s|quiero|deseo|comprar|pagar|adquirir|a|para|en|con|de|por)\b", " ", lower)
+    clean = re.sub(r"\$?\s*\d+(?:\.\d{1,2})?\s*(?:dolares|dólares|usd|\$)?", " ", clean)
+    clean = re.sub(r"\b(banco|venezuela|bdv|banesco|mercantil|provincial|bbva|activo|bancamiga|bnc|\d{4})\b", " ", clean)
+    clean = " ".join(clean.split()).strip()
+    item_desc = clean.title() if clean else text.strip()
 
     return PurchaseIntent(
-        item_description=text.strip(),
+        item_description=item_desc,
         amount_usd=amount,
         merchant_hint=merchant_hint,
         customer_bank=bank,
@@ -132,12 +145,11 @@ def fallback_explain_quotes(quotes: list[dict]) -> str:
 
 
 class GeminiClient:
-    """Cliente para la API de Google Gemini (vía REST nativo)."""
+    """Cliente para la API de Google Gemini (vía REST nativo con redundancia de modelos)."""
 
-    def __init__(self, api_key: str, model: str = "gemini-flash-lite-latest"):
+    def __init__(self, api_key: str, model: str = "gemini-3.1-flash-lite"):
         self.api_key = api_key
-        self.model = model
-        self.url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        self.model = model or "gemini-3.1-flash-lite"
 
     def generate(self, prompt: str, *, system_instruction: str = "", response_json: bool = False) -> str:
         import requests
@@ -150,11 +162,30 @@ class GeminiClient:
         if response_json:
             body["generationConfig"] = {"responseMimeType": "application/json"}
 
-        r = requests.post(self.url, json=body, headers={"Content-Type": "application/json"}, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text}")
+        # Lista de modelos por orden de preferencia para alta disponibilidad
+        models_to_try = [self.model]
+        for fallback_m in ["gemini-3.1-flash-lite", "gemini-flash-lite-latest"]:
+            if fallback_m not in models_to_try:
+                models_to_try.append(fallback_m)
+
+        last_err = None
+        for m in models_to_try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={self.api_key}"
+            try:
+                r = requests.post(url, json=body, headers={"Content-Type": "application/json"}, timeout=12)
+                if r.status_code == 200:
+                    data = r.json()
+                    candidates = data.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        if parts and "text" in parts[0]:
+                            return parts[0]["text"].strip()
+                last_err = RuntimeError(f"Gemini API error ({m}) {r.status_code}: {r.text}")
+            except Exception as exc:
+                last_err = exc
+                continue
+
+        raise last_err or RuntimeError("Gemini generate failed")
 
 
 class AgentBrain:
@@ -169,7 +200,7 @@ class AgentBrain:
         gemini_key = settings.gemini_api_key or (settings.openai_api_key if settings.openai_api_key.startswith("AIza") else "")
         if gemini_key:
             try:
-                self.gemini = GeminiClient(gemini_key, settings.gemini_model or "gemini-flash-lite-latest")
+                self.gemini = GeminiClient(gemini_key, settings.gemini_model or "gemini-3.1-flash-lite")
             except Exception:
                 pass
 
@@ -189,9 +220,13 @@ class AgentBrain:
         if self.gemini:
             try:
                 sys_prompt = (
-                    "Eres el agente de recepción de PUENTE. Extrae en formato JSON exacto: "
-                    "'amount_usd' (float o null), 'customer_bank' (str código 4 dígitos ej '0102' para Venezuela o null), "
-                    "'merchant_hint' (str o null), 'item_description' (str). Devuelve ÚNICAMENTE el JSON."
+                    "Eres el agente de compras y recepción de PUENTE.\n"
+                    "Dado el mensaje en lenguaje natural de un usuario venezolano, extrae en formato JSON:\n"
+                    "- item_description: Nombre limpio y conciso del producto o servicio (ejemplo: 'Riot Points', 'Curso de Python', 'Suscripción SaaS'). NUNCA incluyas saludos ('hola'), verbos ('quiero', 'pagar'), ni montos aquí.\n"
+                    "- amount_usd: Monto numérico en USD si lo indicó (ejemplo: 20.0), o null.\n"
+                    "- merchant_hint: Nombre de la tienda o plataforma asociada (ejemplo: 'Riot Games', 'Steam', 'Platzi', 'Amazon'), o null.\n"
+                    "- customer_bank: Código de 4 dígitos del banco emisor venezolano si lo mencionó (ej: '0102' Banco de Venezuela, '0134' Banesco, '0105' Mercantil, '0171' Banco Activo, '0172' Bancamiga, '0191' BNC), o null.\n"
+                    "Devuelve ÚNICAMENTE el objeto JSON sin markdown ni explicaciones."
                 )
                 raw = self.gemini.generate(text, system_instruction=sys_prompt, response_json=True)
                 d = json.loads(raw)

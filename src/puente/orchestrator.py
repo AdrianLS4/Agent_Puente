@@ -164,18 +164,31 @@ class Orchestrator:
             from .agents import fallback_parse_intent
             intent = fallback_parse_intent(natural_text)
 
-        # Buscar item de catálogo que coincida por monto o título
+        # Buscar o registrar dinámicamente el item que el usuario realmente pidió
         item = None
-        if intent.amount_usd:
-            item = self._row(
-                "SELECT * FROM catalog_items WHERE active=1 ORDER BY ABS(price_usd - ?) ASC LIMIT 1",
-                intent.amount_usd)
-        if not item and intent.merchant_hint:
-            item = self._row(
-                "SELECT * FROM catalog_items WHERE active=1 AND title LIKE ? LIMIT 1",
-                f"%{intent.merchant_hint}%")
+        term = intent.item_description or intent.merchant_hint
+        if term:
+            item = self._row("SELECT * FROM catalog_items WHERE active=1 AND LOWER(title) LIKE LOWER(?) LIMIT 1",
+                             f"%{term}%")
+
+        # Si no existe en el catálogo estático, lo registramos dinámicamente a pedido del usuario
         if not item:
-            item = self._row("SELECT * FROM catalog_items WHERE active=1 ORDER BY id ASC LIMIT 1")
+            merchant_name = intent.merchant_hint or "Comercio Online"
+            m_row = self._row("SELECT id FROM merchants WHERE LOWER(name) LIKE LOWER(?) LIMIT 1", f"%{merchant_name}%")
+            if not m_row:
+                cur_m = self.conn.execute(
+                    "INSERT INTO merchants (name, category, delivery_type) VALUES (?, 'digital', 'digital')",
+                    (merchant_name,))
+                merchant_id = cur_m.lastrowid
+            else:
+                merchant_id = m_row["id"]
+
+            title = (intent.item_description or f"Compra {merchant_name}").strip()
+            price = float(intent.amount_usd) if intent.amount_usd and intent.amount_usd > 0 else 20.0
+            cur_item = self.conn.execute(
+                "INSERT INTO catalog_items (merchant_id, title, price_usd, active) VALUES (?, ?, ?, 1)",
+                (merchant_id, title.title(), price))
+            item = self._row("SELECT * FROM catalog_items WHERE id=?", cur_item.lastrowid)
 
         final_bank = bank or intent.customer_bank or "0102"
         res = self.create_request(customer_id, item["id"], final_bank, idempotency_key)

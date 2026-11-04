@@ -412,3 +412,14 @@ def test_policy_matrix():
     assert ok(strength="none")[0] == {"accept", "human"}
     assert ok(amount_usd=500) == ({"human"}, "E_DISPUTE_HIGH_VALUE")
     assert ok(hours_left=5) == ({"human"}, "E_DISPUTE_DEADLINE_NEAR")
+
+
+def test_create_request_from_text_dynamic_item():
+    conn, orch, gw, _ = build()
+    res = orch.create_request_from_text(1, "hola quiero pagar 20$ a para riot points", "test-key-dyn")
+    assert res.ok
+    matched = res.data["matched_item"]
+    assert matched["price_usd"] == 20.0
+    assert "Riot" in matched["title"]
+    assert res.data["parsed_intent"]["amount_usd"] == 20.0
+

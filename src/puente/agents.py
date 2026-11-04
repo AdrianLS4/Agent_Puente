@@ -74,14 +74,23 @@ def fallback_parse_intent(text: str) -> PurchaseIntent:
 
     # 2. Código de Banco VE
     bank = None
-    if "0102" in lower or "venezuela" in lower or "bdv" in lower:
+    code_match = re.search(r"\b(01\d{2})\b", text)
+    if code_match:
+        bank = code_match.group(1)
+    elif "venezuela" in lower or "bdv" in lower:
         bank = "0102"
-    elif "0134" in lower or "banesco" in lower:
+    elif "banesco" in lower:
         bank = "0134"
-    elif "0105" in lower or "mercantil" in lower:
+    elif "mercantil" in lower:
         bank = "0105"
-    elif "0108" in lower or "provincial" in lower or "bbva" in lower:
+    elif "provincial" in lower or "bbva" in lower:
         bank = "0108"
+    elif "activo" in lower:
+        bank = "0171"
+    elif "bancamiga" in lower:
+        bank = "0172"
+    elif "bnc" in lower:
+        bank = "0191"
 
     # 3. Comercio / Producto
     merchant_hint = None

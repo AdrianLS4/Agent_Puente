@@ -19,7 +19,8 @@ def seed(conn: sqlite3.Connection) -> None:
         (1, "Suscripción SaaS (1 año)", 120.0),
         (2, "Teclado mecánico", 45.0),
     ])
-    banks = json.dumps(["0102", "0105", "0108", "0134"])
+    # Bancos soportados: Venezuela, Mercantil, Provincial, Banesco, Banco Activo, Bancamiga, BNC, etc.
+    banks = json.dumps(["0102", "0104", "0105", "0108", "0114", "0115", "0134", "0151", "0163", "0166", "0168", "0169", "0171", "0172", "0174", "0175", "0177", "0191"])
     rows = [
         # name, email, verified, kyc, status, done, disp, fail, settle_min, capacity, margin, fee
         ("Proveedor A (nuevo, barato)", "a@sandbox.test", 1, 2, "active", 3, 0, 0, 20, 500, 1.5, 0.0),
@@ -43,6 +44,7 @@ def seed(conn: sqlite3.Connection) -> None:
             (1, "pago_movil", "0102", "0412-1112233", "V-20111222", "Alejandro Pérez (Prov A)", 1),
             (2, "pago_movil", "0102", "0414-9988776", "V-15888999", "Carlos Gómez (Prov B)", 1),
             (2, "pago_movil", "0134", "0414-9988776", "V-15888999", "Carlos Gómez (Prov B)", 1),
+            (2, "pago_movil", "0171", "0414-9988776", "V-15888999", "Carlos Gómez (Prov B)", 1),
             (3, "pago_movil", "0102", "0416-5554433", "V-12333444", "Daniela Rivas (Prov C)", 1),
         ]
     )

@@ -252,53 +252,83 @@ def sc_escrow():
 
 
 def interactive_chat():
-    """Modo conversacional interactivo (asistente PUENTE en terminal)."""
+    """Modo conversacional interactivo con IA (asistente PUENTE en terminal)."""
     conn, orch, gw, _ = build()
     print("━" * 65)
-    print("🤖 ¡Hola! Soy PUENTE, tu agente de compras P2P transfronterizas.")
+    print("🤖 ¡Hola! Soy PUENTE, tu agente de compras P2P asistido por IA.")
     print("━" * 65)
-    print("Catálogo de productos disponibles hoy:")
-    items = conn.execute("SELECT c.id, c.title, c.price_usd, m.name as merchant FROM catalog_items c JOIN merchants m ON c.merchant_id=m.id WHERE c.active=1").fetchall()
-    for it in items:
-        print(f"  [{it['id']}] {it['title']:<38} ${it['price_usd']:>6.2f} USD ({it['merchant']})")
+    print("Escribí libremente lo que querés comprar y cómo deseás pagar:")
+    print("Ejemplos:")
+    print("  • 'Hola, quiero comprar el curso de Python de 29 dólares con Banco de Venezuela'")
+    print("  • 'Quiero una suscripción SaaS de 120$ y pago con Banco Activo'")
+    print("  • 'Comprar teclado mecánico de 45$ con Banesco'")
     print("━" * 65)
 
-    choice = input("\n👉 ¿Qué producto querés comprar? (Ingresá el número 1, 2 o 3) [1]: ").strip() or "1"
-    item_id = int(choice) if choice.isdigit() else 1
-
-    bank = input("👉 ¿En qué banco tenés tus Bolívares? (0102=Venezuela, 0134=Banesco, 0105=Mercantil) [0102]: ").strip() or "0102"
+    user_text = input("\n💬 Escribí acá tu mensaje: ").strip()
+    if not user_text:
+        user_text = "Quiero el curso de Python de 29 dólares y pago con Banco de Venezuela"
+        print(f"   (Entrada por defecto: '{user_text}')")
 
     key = f"chat-{int(time.time())}"
-    print(f"\n⏳ Procesando tu solicitud...")
-    rid = orch.create_request(1, item_id, bank, key).data["request_id"]
+    print(f"\n🧠 Analizando tu mensaje con Inteligencia Artificial (Gemini)...")
+    req_res = orch.create_request_from_text(1, user_text, key)
+    if not req_res.ok:
+        print(f"❌ Error al procesar solicitud: {req_res.message_es}")
+        return
+
+    rid = req_res.data["request_id"]
+    intent = req_res.data.get("parsed_intent", {})
+    matched_item = req_res.data.get("matched_item", {})
+
+    print(f"\n✅ Intención detectada:")
+    print(f"   • Producto: {matched_item.get('title', 'Item')} (${matched_item.get('price_usd', 0):.2f} USD)")
+    print(f"   • Banco detectado: {intent.get('customer_bank') or '0102 (Por defecto)'}")
+
+    print(f"\n📈 Cotizando en tiempo real con tasa de mercado...")
     q_res = orch.quote(rid)
-    print(f"📈 Tasa de mercado de referencia: {q_res.data.get('fx_rate')} Bs/USD")
+    if not q_res.ok:
+        print(f"\n❌ Error al cotizar: {q_res.message_es}")
+        rejected = q_res.data.get("rejected", {})
+        if "bank_unsupported" in rejected.values():
+            print(f"   El banco ingresado no tiene proveedores activos en este momento.")
+        return
+
+    fx_rate = q_res.data.get("fx_rate", 0)
+    print(f"   Tasa de cambio de referencia: {fx_rate:.2f} Bs/USD (en vivo)")
 
     quotes = q_res.data.get("quotes", [])
-    print("\nProveedores disponibles encontrados y rankeados:")
+    print(f"\nProveedores de liquidez rankeados:")
     for x in quotes:
-        print(f"  #{x['rank']} {x['display_name']:<32} Total: {x['total_ves']:>10.2f} Bs.  Score: {x['score']}/100")
+        print(f"  #{x['rank']} {x['display_name']:<30} Total: {x['total_ves']:>10.2f} Bs.  Score: {x['score']:.1f}/100")
+
+    ai_exp = q_res.data.get("ai_explanation")
+    if ai_exp:
+        print(f"\n🤖 Asesoría de IA (Gemini):")
+        print(f"   \"{ai_exp}\"")
 
     orch.select_quote(rid, 1)
-    print(f"\n✅ Seleccionado el Proveedor #1 (Mejor precio y reputación).")
+    print(f"\n✅ Proveedor #1 seleccionado para la operación.")
 
-    print("\n⏳ Creando orden de retención (Escrow) en PayPal...")
+    print(f"\n⏳ Creando orden de retención (Escrow) en PayPal...")
     escrow = orch.create_escrow_order(rid)
-    oid = escrow.data["paypal_order_id"]
+    if not escrow.ok:
+        print(f"❌ Error al crear orden en PayPal: {escrow.message_es}")
+        return
 
+    oid = escrow.data["paypal_order_id"]
     if isinstance(gw, MockPayPal):
         gw.approve(oid)
     else:
-        print(f"\n🔗 [SANDBOX] Link de aprobación de PayPal para retener los fondos:")
-        print(f"   {escrow.data['approve_url']}")
-        input("\nPresioná [ENTER] una vez que hayas aprobado en PayPal Sandbox...")
+        print(f"\n🔗 [SANDBOX] Link de PayPal para que el proveedor retenga los fondos:")
+        print(f"   >>> {escrow.data['approve_url']}\n")
+        input("   Presioná [ENTER] una vez que hayas aprobado en PayPal Sandbox...")
 
     print("\n🔒 Bloqueando dólares en PayPal...")
     locked = orch.lock_usd_escrow(rid)
     ticket = locked.data["ticket"]
     print_pago_movil_ticket(ticket)
 
-    ref = input(f"📲 Ingresá el número de comprobante/referencia de tu Pago Móvil: ").strip() or f"REF-{rid}7788"
+    ref = input(f"📲 Ingresá el número de comprobante/referencia de tu Pago Móvil [REF-{rid}9988]: ").strip() or f"REF-{rid}9988"
     orch.confirm_ves(rid, ref, ticket["total_ves"])
     print(f"\n✅ Pago Móvil registrado con referencia: {ref}")
 

@@ -510,9 +510,18 @@ class Orchestrator:
         if not escrow.ok:
             return escrow
         oid = escrow.data.get("paypal_order_id")
+        approve_url = escrow.data.get("approve_url") or f"https://www.sandbox.paypal.com/checkoutnow?token={oid}"
+        req = self._req(rid)
+        item = self._row("SELECT * FROM catalog_items WHERE id=?", req["item_id"])
+        body = (
+            f"El cliente confirmó la cotización #{rank} para «{item['title']}» (US$ {req['amount_usd']:.2f}).\n"
+            f"Por favor aprueba la orden para retener los fondos en PayPal Sandbox:\n"
+            f"👉 {approve_url}\n\n"
+            f"En cuanto apruebes, el cliente recibirá tus datos de Pago Móvil para transferirte los Bolívares."
+        )
         self.conn.execute(
             "INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'provider', ?)",
-            (rid, f"El cliente confirmó la cotización #{rank}. Por favor aprueba la orden en PayPal Sandbox (ID: {oid}).")
+            (rid, body)
         )
         self.conn.commit()
         return StepResult(True, S.AWAITING_PROVIDER_APPROVAL, f"Cotización #{rank} confirmada. Orden creada en PayPal.",

@@ -1,0 +1,60 @@
+/* Único CSS del proyecto: la paleta. Todo lo demás son clases utilitarias en los componentes.
+   Para cambiar la identidad visual basta con tocar estos valores. */
+@import "tailwindcss";
+
+:root {
+  --bg: #f5f4f0;
+  --surface: #ffffff;
+  --sunken: #efede8;
+  --ink: #1c2024;
+  --muted: #6a6f76;
+  --line: #e2dfd8;
+  --accent: #0e5a4b;
+  --accent-ink: #ffffff;
+  --accent-soft: #e2eeea;
+  --ok: #1d7a4a;
+  --warn: #a8560a;
+  --warn-soft: #f7ebdc;
+  --bad: #b3261e;
+  --bad-soft: #f8e4e2;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101312;
+    --surface: #181c1b;
+    --sunken: #131615;
+    --ink: #e9ebe8;
+    --muted: #9aa09c;
+    --line: #2a302e;
+    --accent: #5fc2a6;
+    --accent-ink: #0b1411;
+    --accent-soft: #1b2b27;
+    --ok: #62c58c;
+    --warn: #e0a15a;
+    --warn-soft: #2b2218;
+    --bad: #f08a82;
+    --bad-soft: #2d1b1a;
+  }
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+body { background: var(--bg); color: var(--ink); font-family: var(--font-sans); }

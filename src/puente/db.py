@@ -31,6 +31,16 @@ def connect(path: str = ":memory:", check_same_thread: bool = False) -> sqlite3.
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(Path(ROOT / "schema.sql").read_text(encoding="utf-8"))
+    for stmt in (
+        "ALTER TABLE catalog_items ADD COLUMN billing_kind TEXT NOT NULL DEFAULT 'one_time'",
+        "ALTER TABLE outbox ADD COLUMN template TEXT NOT NULL DEFAULT 'lock_request'",
+        "ALTER TABLE ves_payments ADD COLUMN payer_bank TEXT",
+        "ALTER TABLE ves_payments ADD COLUMN payer_phone TEXT",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 

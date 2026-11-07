@@ -512,20 +512,24 @@ class Orchestrator:
         oid = escrow.data.get("paypal_order_id")
         approve_url = escrow.data.get("approve_url") or f"https://www.sandbox.paypal.com/checkoutnow?token={oid}"
         req = self._req(rid)
+        q = self._row("SELECT * FROM quotes WHERE id=?", req["selected_quote_id"])
         item = self._row("SELECT * FROM catalog_items WHERE id=?", req["item_id"])
+        m = self._row("SELECT name FROM merchants WHERE id=?", req["merchant_id"])
+        m_name = m["name"] if m else "el comercio"
         body = (
-            f"El cliente confirmó la cotización #{rank} para «{item['title']}» (US$ {req['amount_usd']:.2f}).\n"
-            f"Por favor aprueba la orden para retener los fondos en PayPal Sandbox:\n"
-            f"👉 {approve_url}\n\n"
-            f"En cuanto apruebes, el cliente recibirá tus datos de Pago Móvil para transferirte los Bolívares."
+            f"Compra #{rid}: {item['title']} — US$ {req['amount_usd']:.2f} a {m_name}.\n"
+            f"1) Aprueba el pago en PayPal: {approve_url}\n"
+            f"   Aprobar no mueve tu dinero todavía: PUENTE solo cobra cuando tú confirmes que recibiste los Bs.\n"
+            f"2) Después le mostramos tus datos de Pago Móvil al cliente, que te pagará Bs. {q['total_ves']:,.2f}.\n"
+            f"Tienes 15 min para aprobar."
         )
         self.conn.execute(
-            "INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'provider', ?)",
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'provider', 'lock_request', ?)",
             (rid, body)
         )
         self.conn.commit()
         return StepResult(True, S.AWAITING_PROVIDER_APPROVAL, f"Cotización #{rank} confirmada. Orden creada en PayPal.",
-                          None, {"paypal_order_id": oid})
+                          None, {"paypal_order_id": oid, "approve_url": approve_url})
 
     def on_provider_locked(self, rid: int) -> StepResult:
         """Verifica si el proveedor aprobó la orden en PayPal y emite los datos de Pago Móvil en outbox."""
@@ -546,12 +550,12 @@ class Orchestrator:
                     self.lock_usd_escrow(rid)
                 except Exception:
                     pass
-                self._to(rid, S.AWAITING_VES)
+                self._to(rid, S.AWAITING_VES, event_type="provider_locked")
 
             ticket = self.get_pago_movil_ticket(rid)
             phone_clean = re.sub(r"\D", "", ticket["phone"])
-            body = (
-                f"El proveedor ya bloqueó tu pago en PayPal. Ahora paga EXACTAMENTE Bs. {ticket['total_ves']:,.2f} "
+            body_cust = (
+                f"El proveedor ya bloqueó tu pago en PayPal. Paga exactamente Bs. {ticket['total_ves']:,.2f} "
                 f"por Pago Móvil a:\n"
                 f"  • Banco: {ticket['bank_name']} ({ticket['bank_code']})\n"
                 f"  • Teléfono: {ticket['phone']} ({phone_clean})\n"
@@ -561,32 +565,101 @@ class Orchestrator:
                 f"  • Concepto: {ticket['concept_code']}\n"
                 f"Tienes 30 min. Luego envía el número de referencia del comprobante."
             )
-            already = self.conn.execute("SELECT id FROM outbox WHERE request_id=? AND to_role='customer'", (rid,)).fetchone()
+            already = self.conn.execute("SELECT id FROM outbox WHERE request_id=? AND template='pay_instructions'", (rid,)).fetchone()
             if not already:
-                self.conn.execute("INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'customer', ?)",
-                                  (rid, body))
+                self.conn.execute(
+                    "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'pay_instructions', ?)",
+                    (rid, body_cust)
+                )
+                self.conn.execute(
+                    "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'provider', 'await_customer', ?)",
+                    (rid, f"Pago bloqueado. Esperando los Bs. {ticket['total_ves']:,.2f} del cliente.")
+                )
                 self.conn.commit()
             return StepResult(True, S.AWAITING_VES, "Dólares retenidos en PayPal. Instrucciones emitidas.", None, {"ticket": ticket})
         return StepResult(False, S.AWAITING_PROVIDER_APPROVAL, "El proveedor todavía no aprueba la orden en PayPal.", "E_NOT_APPROVED")
 
-    def report_ves_payment(self, rid: int, bank_reference: str, amount_ves: float) -> StepResult:
-        res = self.confirm_ves(rid, bank_reference, amount_ves)
-        if not res.ok:
-            return res
+    def report_ves_payment(
+        self, rid: int, bank_reference: str, amount_ves: float,
+        *, payer_bank: str | None = None, payer_phone: str | None = None
+    ) -> StepResult:
+        req = self._req(rid)
+        q = self._row("SELECT * FROM quotes WHERE id=?", req["selected_quote_id"])
+        pay = self._row("SELECT * FROM ves_payments WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
+        if self._row("SELECT 1 FROM ves_payments WHERE reference=? AND id<>?", bank_reference, pay["id"]):
+            res = resolve("E_VES_DUPLICATE_REF")
+            self._log_error(rid, res, 0, {"reference": bank_reference})
+            return self._apply_failure(rid, res)
         self.conn.execute(
-            "INSERT INTO outbox (request_id, to_role, body) VALUES (?, 'provider', ?)",
-            (rid, f"El cliente reportó el Pago Móvil (Ref: {bank_reference}) por Bs. {amount_ves:,.2f}. Verifica y confirma.")
+            "UPDATE ves_payments SET reference=?, amount_ves=?, payer_bank=?, payer_phone=? WHERE id=?",
+            (bank_reference, amount_ves, payer_bank, payer_phone, pay["id"])
+        )
+        if abs(amount_ves - q["total_ves"]) / q["total_ves"] * 100 > self.s.ves_amount_tolerance_pct:
+            res = resolve("E_VES_AMOUNT_MISMATCH")
+            self._log_error(rid, res, 0, {"expected": q["total_ves"], "received": amount_ves})
+            return self._apply_failure(rid, res)
+        self._to(rid, S.VES_REPORTED, actor="customer", event_type="ves_reported",
+                 payload={"reference": bank_reference, "amount_ves": amount_ves, "payer_bank": payer_bank, "payer_phone": payer_phone})
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'report_received', ?)",
+            (rid, "Recibimos tu referencia. El proveedor la está verificando.")
+        )
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'provider', 'verify_payment', ?)",
+            (rid, f"El cliente dice que pagó Bs. {amount_ves:,.2f}. Referencia {bank_reference}.")
         )
         self.conn.commit()
-        return StepResult(True, "VES_REPORTED", f"Pago Móvil registrado con referencia {bank_reference}.", "OK")
+        return StepResult(True, S.VES_REPORTED, f"Pago Móvil registrado con referencia {bank_reference}.", None)
 
     def provider_confirm_ves(self, rid: int, provider_id: int) -> StepResult:
+        req = self._req(rid)
+        if req["state"] == S.VES_REPORTED:
+            now = self.clock()
+            self.conn.execute("UPDATE ves_payments SET status='confirmed', confirmed_at=? WHERE request_id=?", (iso(now), rid))
+            self._to(rid, S.VES_CONFIRMED, actor="provider", event_type="ves_confirmed")
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'ves_confirmed', ?)",
+            (rid, "El proveedor confirmó tu pago. Estamos completando la compra.")
+        )
         res = self.provider_release_and_capture(rid)
         if not res.ok:
             return res
+        m = self._row("SELECT name FROM merchants WHERE id=?", req["merchant_id"])
+        m_name = m["name"] if m else "el comercio"
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'paid', ?)",
+            (rid, f"Pagamos US$ {req['amount_usd']:.2f} a {m_name}. Ahora esperamos la entrega.")
+        )
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'provider', 'captured', ?)",
+            (rid, f"Se cobraron US$ {req['amount_usd']:.2f} de tu PayPal para {m_name}.")
+        )
         self.record_delivery(rid, proof="LICENCIA-PUENTE-P2P", delivered=True)
         self.confirm_receipt(rid)
-        return StepResult(True, S.COMPLETED, "Bolívares confirmados, dólares capturados y entrega completada.", "OK")
+        self.conn.commit()
+        return StepResult(True, S.COMPLETED, "Bolívares confirmados, dólares capturados y entrega completada.", None)
+
+    def provider_reject_ves(self, rid: int, reason: str) -> StepResult:
+        if reason == "wrong_reference":
+            self.conn.execute("UPDATE ves_payments SET reference=NULL WHERE request_id=?", (rid,))
+            self._to(rid, S.AWAITING_VES, actor="provider", event_type="ref_mismatch")
+            self.conn.execute(
+                "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'ref_mismatch', ?)",
+                (rid, "El proveedor no encuentra esa referencia. Revisa el comprobante y envíala de nuevo.")
+            )
+            self.conn.commit()
+            return StepResult(True, S.AWAITING_VES, "Referencia rechazada por el proveedor.", None)
+        self.cancel_escrow(rid)
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'expired', ?)",
+            (rid, "El proveedor no confirmó tu pago. Cerramos la solicitud; si ya pagaste, escribe a soporte con tu comprobante.")
+        )
+        self.conn.execute(
+            "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'provider', 'released', ?)",
+            (rid, "Liberamos tu reserva en PayPal; no se cobró nada.")
+        )
+        self.conn.commit()
+        return StepResult(True, S.EXPIRED, "Solicitud cerrada y custodia liberada.", None)
 
     def create_paypal_invoice(self, rid: int) -> StepResult:
         """Crea y envía una factura de PayPal para la solicitud (vía Invoicing v2)."""

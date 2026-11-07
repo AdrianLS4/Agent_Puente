@@ -192,3 +192,104 @@ def test_p2p_api_intent_and_escrow_flow(test_setup):
     # Verificar estado final en la base de datos
     db_req = conn.execute("SELECT state FROM purchase_requests WHERE id=?", (rid,)).fetchone()
     assert db_req["state"] == S.COMPLETED
+
+
+class _ScriptedWebLLM:
+    def __init__(self, turns):
+        self.turns = list(turns)
+
+    def complete(self, messages, tools):
+        return self.turns.pop(0)
+
+
+def test_puente_ui_three_column_full_flow():
+    """Prueba de punta a punta de todos los endpoints consumidos por puente-ui (api.ts)."""
+    conn, orch, gw, clock = build(mock=True)
+    llm = _ScriptedWebLLM([
+        {
+            "tool_calls": [
+                {"function": {"name": "get_quotes", "arguments": {"item_id": 1, "bank": "0102"}}},
+                {"function": {"name": "propose_purchase", "arguments": {"rank": 1}}},
+            ]
+        },
+        {"content": "Encontré proveedores verificados y te propongo el #1."},
+        {"content": "Orden creada. Le avisé al proveedor para que bloquee el pago en PayPal."},
+    ])
+    app = create_app(conn=conn, orch=orch, llm=llm, enable_scheduler=False)
+    client = TestClient(app)
+
+    # 1. Cliente chatea en la columna izquierda
+    r_chat = client.post("/chat", json={"session_id": "sid-ui-1", "text": "Quiero el curso de Python con BDV"})
+    assert r_chat.status_code == 200
+    chat_data = r_chat.json()
+    assert len(chat_data["trace"]) == 2
+    assert chat_data["trace"][0]["name"] == "get_quotes"
+    assert chat_data["trace"][1]["name"] == "propose_purchase"
+    assert len(chat_data["offers"]) >= 1
+    assert chat_data["pending"]["rank"] == 1
+    assert chat_data["requestId"] is None
+
+    # 2. Cliente confirma la propuesta en su tarjeta
+    r_conf = client.post("/chat/sid-ui-1/confirm")
+    assert r_conf.status_code == 200
+    conf_data = r_conf.json()
+    rid = conf_data["requestId"]
+    assert rid is not None
+    assert conf_data["trace"][0]["name"] == "confirm_purchase"
+
+    # 3. UI consulta la vista de la solicitud (Estado + bandejas)
+    r_view1 = client.get(f"/p2p/requests/{rid}/view")
+    assert r_view1.status_code == 200
+    v1 = r_view1.json()
+    assert v1["state"] == "AWAITING_PROVIDER_APPROVAL"
+    assert v1["payment"] is None  # Aún no bloqueado en PayPal
+    assert any(m["template"] == "lock_request" and m["role"] == "provider" for m in v1["inbox"])
+
+    # 4. Proveedor aprueba en PayPal desde su columna
+    r_app = client.post(f"/demo/provider/approve/{rid}")
+    assert r_app.status_code == 200
+    v2 = client.get(f"/p2p/requests/{rid}/view").json()
+    assert v2["state"] == "AWAITING_VES"
+    assert v2["payment"] is not None
+    assert v2["payment"]["totalVes"] == v2["totalVes"]
+
+    # 5. Cliente reporta referencia equivocada -> proveedor rechaza por wrong_reference -> vuelve a AWAITING_VES
+    r_rep1 = client.post(f"/p2p/requests/{rid}/report", json={
+        "bank_reference": "00009999",
+        "amount_ves": v2["totalVes"],
+        "payer_bank": "Banesco",
+        "payer_phone": "04141234567",
+    })
+    assert r_rep1.status_code == 200
+    v3 = client.get(f"/p2p/requests/{rid}/view").json()
+    assert v3["state"] == "VES_REPORTED"
+    assert v3["report"]["reference"] == "00009999"
+
+    r_rej = client.post(f"/p2p/requests/{rid}/provider/reject", json={"reason": "wrong_reference"})
+    assert r_rej.status_code == 200
+    v4 = client.get(f"/p2p/requests/{rid}/view").json()
+    assert v4["state"] == "AWAITING_VES"
+    assert v4["report"] is None
+    assert any(m["template"] == "ref_mismatch" for m in v4["inbox"])
+
+    # 6. Cliente reporta referencia correcta y proveedor confirma
+    r_rep2 = client.post(f"/p2p/requests/{rid}/report", json={
+        "bank_reference": "98765432",
+        "amount_ves": v2["totalVes"],
+        "payer_bank": "Banesco",
+        "payer_phone": "04141234567",
+    })
+    assert r_rep2.status_code == 200
+
+    r_pconf = client.post(f"/p2p/requests/{rid}/provider/confirm")
+    assert r_pconf.status_code == 200
+    v5 = client.get(f"/p2p/requests/{rid}/view").json()
+    assert v5["state"] == "COMPLETED"
+    assert any(m["template"] == "paid" for m in v5["inbox"])
+    assert any(m["template"] == "captured" for m in v5["inbox"])
+
+    # 7. Reiniciar demo
+    r_reset = client.post("/demo/reset")
+    assert r_reset.status_code == 200
+    assert conn.execute("SELECT COUNT(*) FROM purchase_requests").fetchone()[0] == 0
+

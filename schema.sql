@@ -70,7 +70,8 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 CREATE TABLE IF NOT EXISTS outbox (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id  INTEGER REFERENCES purchase_requests(id),
-  to_role     TEXT NOT NULL CHECK (to_role IN ('customer','provider','merchant','admin')),
+  to_role     TEXT NOT NULL CHECK (to_role IN ('customer','provider','merchant','admin','operator')),
+  template    TEXT NOT NULL DEFAULT 'lock_request',
   body        TEXT NOT NULL,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -129,6 +130,8 @@ CREATE TABLE IF NOT EXISTS ves_payments (
   method        TEXT NOT NULL DEFAULT 'pago_movil',
   reference     TEXT UNIQUE,                       -- referencia bancaria: UNIQUE anti-reuso
   amount_ves    REAL,
+  payer_bank    TEXT,
+  payer_phone   TEXT,
   status        TEXT NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending','confirmed','rejected','refund_pending','refunded')),
   confirmed_at  TEXT,

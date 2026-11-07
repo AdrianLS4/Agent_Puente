@@ -626,16 +626,19 @@ class Orchestrator:
             return res
         m = self._row("SELECT name FROM merchants WHERE id=?", req["merchant_id"])
         m_name = m["name"] if m else "el comercio"
+        cust = self._row("SELECT email FROM customers WHERE id=?", req["customer_id"])
+        cust_email = cust["email"] if cust else "cliente@puente.app"
+        license_code = f"PUENTE-LIC-{rid:04d}"
+        self.record_delivery(rid, proof=license_code, delivered=True)
+        self.confirm_receipt(rid)
         self.conn.execute(
             "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'customer', 'paid', ?)",
-            (rid, f"Pagamos US$ {req['amount_usd']:.2f} a {m_name}. Ahora esperamos la entrega.")
+            (rid, f"Pagamos US$ {req['amount_usd']:.2f} a {m_name}. Tu entrega ya fue activada en {cust_email} (Código: {license_code}).")
         )
         self.conn.execute(
             "INSERT INTO outbox (request_id, to_role, template, body) VALUES (?, 'provider', 'captured', ?)",
             (rid, f"Se cobraron US$ {req['amount_usd']:.2f} de tu PayPal para {m_name}.")
         )
-        self.record_delivery(rid, proof="LICENCIA-PUENTE-P2P", delivered=True)
-        self.confirm_receipt(rid)
         self.conn.commit()
         return StepResult(True, S.COMPLETED, "Bolívares confirmados, dólares capturados y entrega completada.", None)
 

@@ -94,7 +94,13 @@ function Dock({ demo }: { demo: Demo }) {
     case "pay": return (<><PaymentCard view={view} /><ReportForm view={view} demo={demo} /></>);
     case "wait_verify": return <Waiting until={view.deadline}>El proveedor está verificando tu referencia.</Waiting>;
     case "wait_capture": return <Waiting>Completando la compra.</Waiting>;
-    case "done": return <Waiting>Compra pagada. Falta la entrega del comercio.</Waiting>;
+    case "done": return (
+      <Waiting>
+        {view.state === "DELIVERED" || view.state === "COMPLETED"
+          ? `Compra completada y entrega activada (${view.item}).`
+          : "Compra pagada. Falta la entrega del comercio."}
+      </Waiting>
+    );
     case "closed": return <Waiting>La solicitud está cerrada.</Waiting>;
   }
 }

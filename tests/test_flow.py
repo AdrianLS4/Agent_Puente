@@ -4,10 +4,15 @@ from datetime import timedelta
 import pytest
 
 from puente import policy
-from puente.cli import build, pay_and_capture
+from puente.cli import build as _cli_build, pay_and_capture
 from puente.errors import CATALOG, Action, map_paypal_error, resolve
 from puente.paypal_gateway import PayPalError
 from puente.state_machine import InvalidTransition, State as S, TRANSITIONS
+
+
+def build(*a, **kw):
+    kw.setdefault("mock", True)
+    return _cli_build(*a, **kw)
 
 
 def quote_and_select(orch, key="k", item=1):

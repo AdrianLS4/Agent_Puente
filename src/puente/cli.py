@@ -97,7 +97,7 @@ def pay_and_capture(orch, gw, rid) -> None:
 
 def sc_happy():
     """Flujo feliz (comercio digital)."""
-    _, orch, gw, _ = build()
+    _, orch, gw, _ = build(mock=not LIVE_MODE)
     rid = start(orch, "k-happy")
     pay_and_capture(orch, gw, rid)
     say("entrega digital", orch.record_delivery(rid, proof="LICENCIA-ABC-123", delivered=True))
@@ -106,7 +106,7 @@ def sc_happy():
 
 def sc_retries():
     """Errores transitorios de PayPal: 429 x2 en create_order, y rechazo de instrumento en la captura."""
-    _, orch, gw, _ = build()
+    _, orch, gw, _ = build(mock=True)
     rid = start(orch, "k-retry")
     gw.fail_next["create_order"] = [PayPalError(429, "RATE_LIMIT_REACHED"), PayPalError(429, "RATE_LIMIT_REACHED")]
     q = orch._row("SELECT total_ves FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
@@ -122,7 +122,7 @@ def sc_retries():
 
 def sc_failover():
     """El proveedor no aprueba el pago: se devuelven Bs., se penaliza y se reabre con otro."""
-    conn, orch, gw, clock = build()
+    conn, orch, gw, clock = build(mock=True)
     rid = start(orch, "k-fo")
     q = orch._row("SELECT total_ves, provider_id FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
     say("pago Bs. confirmado", orch.confirm_ves(rid, "REFFO001", q["total_ves"]))
@@ -139,7 +139,7 @@ def sc_failover():
 
 def sc_delivery_timeout():
     """Pagado pero el comercio no entrega: reembolso PayPal + devolución en Bs."""
-    _, orch, gw, clock = build()
+    _, orch, gw, clock = build(mock=True)
     rid = start(orch, "k-dt")
     pay_and_capture(orch, gw, rid)
     clock.advance(hours=25)
@@ -149,7 +149,7 @@ def sc_delivery_timeout():
 
 
 def _dispute(item_id: int, delivered: bool, hours: float = 72):
-    _, orch, gw, clock = build()
+    _, orch, gw, clock = build(mock=True)
     rid = start(orch, f"k-disp-{item_id}-{delivered}", item_id=item_id)
     pay_and_capture(orch, gw, rid)
     if delivered:
@@ -180,7 +180,7 @@ def sc_dispute_human():
 
 def sc_invoice():
     """Flujo de facturación B2B (Invoicing v2): creación, envío, pago y entrega."""
-    _, orch, gw, _ = build()
+    _, orch, gw, _ = build(mock=not LIVE_MODE)
     rid = start(orch, "k-invoice", item_id=2)
     q = orch._row("SELECT total_ves FROM quotes WHERE id=(SELECT selected_quote_id FROM purchase_requests WHERE id=?)", rid)
     say("pago Bs. confirmado", orch.confirm_ves(rid, f"REFINV{rid}", q["total_ves"]))
@@ -214,7 +214,7 @@ def print_pago_movil_ticket(ticket: dict) -> None:
 
 def sc_escrow():
     """Flujo P2P con Escrow (estilo Binance): retener USD -> Ticket Pago Móvil -> Pagar Bs -> Liberar."""
-    _, orch, gw, _ = build()
+    _, orch, gw, _ = build(mock=not LIVE_MODE)
     rid = start(orch, "k-escrow", item_id=1)
 
     # 1. Crear orden con intent AUTHORIZE

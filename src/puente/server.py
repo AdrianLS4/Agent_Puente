@@ -264,24 +264,19 @@ def create_app(
                 "requestId": _active_request_id(c),
             }
         res = c.confirm_pending()
-        start_idx = len(c.messages)
-        try:
-            reply = c.follow_up()
-        except Exception:
-            reply = ""
-        if not reply.strip():
-            reply = (
-                "Orden creada. Le avisé al proveedor para que bloquee el pago en PayPal. "
-                "Cuando lo haga te muestro los datos para pagar."
-            )
-        extra_trace, _ = _extract_turn_trace(c.messages[start_idx:])
+        reply = (
+            "Orden creada. Le avisé al proveedor para que bloquee el pago en PayPal. "
+            "Cuando lo haga te muestro los datos para pagar."
+            if res.ok
+            else res.message_es
+        )
+        c.messages.append({"role": "assistant", "content": reply})
         trace = [
             {
                 "name": "confirm_purchase",
                 "summary": "ejecutado por el código tras el sí del usuario" if res.ok else res.message_es,
                 "ok": res.ok,
             },
-            *extra_trace,
         ]
         return {
             "reply": reply,
@@ -295,12 +290,8 @@ def create_app(
     def chat_cancel(session_id: str):
         c = _get_session(session_id)
         c.cancel_pending()
-        try:
-            reply = c.follow_up()
-        except Exception:
-            reply = ""
-        if not reply.strip():
-            reply = "Cancelado. No se movió nada."
+        reply = "Cancelado. No se movió nada."
+        c.messages.append({"role": "assistant", "content": reply})
         return {
             "reply": reply,
             "trace": [],
@@ -425,7 +416,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="No hay orden de PayPal para esta solicitud.")
         if hasattr(orch.gw, "approve"):
             orch.gw.approve(po["paypal_order_id"])
-        res = orch.on_provider_locked(request_id)
+        res = orch.on_provider_locked(request_id, force_demo=True)
         if not res.ok:
             raise HTTPException(status_code=400, detail=res.message_es)
         return {"status": "ok", "state": res.state}
@@ -491,6 +482,12 @@ def create_app(
     @app.post("/demo/reset")
     def demo_reset():
         sessions.clear()
+        if hasattr(orch.gw, "orders"):
+            orch.gw.orders.clear()
+        if hasattr(orch.gw, "invoices"):
+            orch.gw.invoices.clear()
+        if hasattr(orch.gw, "_n"):
+            orch.gw._n = 0
         conn.execute("PRAGMA foreign_keys = OFF;")
         tables = [
             r[0]

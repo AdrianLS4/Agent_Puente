@@ -243,7 +243,12 @@ class LivePayPal(PayPalGateway):
                 }
             }]
         }
-        out = self.rest.request("POST", "/v2/checkout/orders", json_body=body, request_id=f"order-auth-{reference_id}")
+        out = self.rest.request(
+            "POST",
+            "/v2/checkout/orders",
+            json_body=body,
+            request_id=f"order-auth-{reference_id}-{int(time.time() * 1000)}",
+        )
         links = {l.get("rel"): l.get("href") for l in out.get("links", [])}
         return {
             "order_id": out["id"],

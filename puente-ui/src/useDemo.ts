@@ -37,7 +37,12 @@ export function useDemo(api: Api) {
 
   const handleReply = useCallback((r: ChatReply) => {
     deliver(routeChatReply(r, nextId("r")));
-    if (r.requestId != null) setRequestId(r.requestId);
+    if (r.requestId != null) {
+      setRequestId(r.requestId);
+    } else if (r.pending != null) {
+      setRequestId(null);
+      setView(null);
+    }
   }, [deliver]);
 
   const send = useCallback((text: string) => run("customer", async () => {

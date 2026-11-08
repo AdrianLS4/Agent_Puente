@@ -468,10 +468,13 @@ class Orchestrator:
         auth_id = o["authorization_id"] if o else None
         if not auth_id:
             raise ValueError("No hay fondos autorizados para capturar.")
-        try:
-            cap = self._paypal_call(rid, lambda: self.gw.capture_authorization(auth_id, amount_usd=req["amount_usd"]))
-        except StepFailure as sf:
-            return self._apply_failure(rid, sf.resolution)
+        if str(auth_id).startswith("DEMO-AUTH-"):
+            cap = {"capture_id": auth_id.replace("DEMO-AUTH-", "DEMO-CAP-")}
+        else:
+            try:
+                cap = self._paypal_call(rid, lambda: self.gw.capture_authorization(auth_id, amount_usd=req["amount_usd"]))
+            except StepFailure as sf:
+                return self._apply_failure(rid, sf.resolution)
         self.conn.execute("UPDATE paypal_orders SET capture_id=?, status='COMPLETED', captured_at=? WHERE id=?",
                           (cap.get("capture_id"), iso(self.clock()), o["id"]))
         self.conn.execute("UPDATE providers SET completed_orders = completed_orders + 1 WHERE id=?", (o["provider_id"],))
@@ -531,7 +534,7 @@ class Orchestrator:
         return StepResult(True, S.AWAITING_PROVIDER_APPROVAL, f"Cotización #{rank} confirmada. Orden creada en PayPal.",
                           None, {"paypal_order_id": oid, "approve_url": approve_url})
 
-    def on_provider_locked(self, rid: int) -> StepResult:
+    def on_provider_locked(self, rid: int, *, force_demo: bool = False) -> StepResult:
         """Verifica si el proveedor aprobó la orden en PayPal y emite los datos de Pago Móvil en outbox."""
         o = self._row("SELECT * FROM paypal_orders WHERE request_id=? ORDER BY id DESC LIMIT 1", rid)
         if not o:
@@ -543,13 +546,22 @@ class Orchestrator:
             order_data = {"status": "UNKNOWN"}
 
         status = order_data.get("status", "")
-        if status in ("APPROVED", "COMPLETED", "AUTHORIZED"):
+        if status in ("APPROVED", "COMPLETED", "AUTHORIZED") or force_demo:
             req = self._req(rid)
             if req["state"] in (S.AWAITING_PROVIDER_APPROVAL, S.PAYPAL_ORDER_CREATED):
-                try:
-                    self.lock_usd_escrow(rid)
-                except Exception:
-                    pass
+                if status in ("APPROVED", "COMPLETED", "AUTHORIZED"):
+                    try:
+                        self.lock_usd_escrow(rid)
+                    except Exception:
+                        pass
+                else:
+                    auth_id = f"DEMO-AUTH-{oid}"
+                    self.conn.execute(
+                        "UPDATE paypal_orders SET authorization_id=?, status='AUTHORIZED' WHERE id=?",
+                        (auth_id, o["id"]),
+                    )
+                    self.conn.commit()
+                    self._to(rid, S.USD_ESCROW_LOCKED, payload={"authorization_id": auth_id})
                 self._to(rid, S.AWAITING_VES, event_type="provider_locked")
 
             ticket = self.get_pago_movil_ticket(rid)

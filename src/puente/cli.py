@@ -395,7 +395,7 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     if a.cmd == "demo":
         s = Settings()
-        if a.live or not s.mock_mode:
+        if a.live:
             LIVE_MODE = True
             if a.scenario == "all":
                 print("━━ Modo LIVE detectado: ejecutando flujo 'happy' contra PayPal Sandbox real y tasa real")

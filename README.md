@@ -4,7 +4,7 @@
 > *Empowering Venezuelans and unbanked Latin Americans to purchase USD goods and services with local currency (VES), orchestrated deterministically over the official PayPal Agent Toolkit.*
 
 [![Live on Render](https://img.shields.io/badge/Render-Live%2024%2F7-brightgreen?logo=render)](https://agent-puente.onrender.com/health)
-[![Tests](https://img.shields.io/badge/pytest-49%20passed-success?logo=pytest)](file:///c:/Users/Mistake/OneDrive/Escritorio/PROYECTOS/puente-agent/tests)
+[![Tests](https://img.shields.io/badge/pytest-67%20passed-success?logo=pytest)](https://github.com/AdrianLS4/Agent_Puente/tree/main/tests)
 [![PayPal](https://img.shields.io/badge/PayPal-Agent%20Toolkit%20v1.11-00457C?logo=paypal)](https://github.com/AdrianLS4/Agent_Puente)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -116,15 +116,30 @@ source .venv/bin/activate  # On Windows: .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 ```
 
-### 2. Run the Automated Test Suite (49 Tests)
+### 2. Run the Automated Test Suite (67 Tests)
 ```bash
 python -m pytest -q
-# Output: 49 passed in 0.63s
+# Output: 67 passed in 1.2s
 ```
 
-### 3. Run the CLI Demos (8 Scenarios)
+### 3. Launch the 3-Column Interactive Web UI (`puente-ui`) + ReAct Concierge (`concierge.py`)
+```bash
+# Terminal 1: Start the FastAPI backend + Gemini ReAct Concierge
+python -m uvicorn puente.server:app --port 8000
+
+# Terminal 2: Start the 3-Column React + Vite UI (Customer · Provider · State)
+cd puente-ui
+npm install
+npm run dev
+# Open http://localhost:5173
+```
+
+### 4. Run the CLI Demos (8 Scenarios & Interactive ReAct Console)
 The built-in CLI tests both offline mock scenarios and live sandbox runs:
 ```bash
+# Interactive ReAct Agent in terminal (Gemini Function Calling + code confirmation):
+python -m puente.concierge --live
+
 # Run all 8 scenarios (happy path, invoices, retries, failovers, dispute contest/accept/human):
 python -m puente.cli demo all
 
